@@ -1,0 +1,18 @@
+[project]
+name = "nethackmcp"
+version = "0.1.0"
+description = "MCP server for playing NetHack"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+nethackmcp = "nethackmcp:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nethackmcp"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
