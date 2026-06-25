@@ -208,18 +208,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 async def main():
     """Run the MCP server via stdio."""
-    params = StdioServerParameters(
-        command="python3",
-        args=["-m", "nethackmcp.server"],
-        env=None
-    )
+    from mcp.server.models import InitializeResult
+    
+    # Build capabilities
+    tools = await list_tools()
+    tool_names = [t["name"] for t in tools]
+    
+    capabilities = {
+        "tools": {
+            "listChanged": True
+        }
+    }
     
     await app.run(
-        params,
+        StdioServerParameters(
+            command="python3",
+            args=["-m", "nethackmcp.server"],
+            env=None
+        ),
         initialization_options=InitializationOptions(
             server_name="nethack",
             server_version="0.1.0",
-            capabilities=app.get_capabilities()
+            capabilities=capabilities
         )
     )
 
