@@ -1,26 +1,66 @@
 """MCP server for playing NetHack."""
 
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
-from mcp import StdioServerParameters
+from __future__ import annotations
+
 import asyncio
-import subprocess
 import json
-import re
-from pathlib import Path
+import subprocess
+import sys
 from typing import Any
+
+import mcp.server.stdio
+import mcp.types as types
+from mcp.server.lowlevel import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
+
+# ============================================================================
+# Server instructions — shown to the AI client to guide usage
+# ============================================================================
+
+SERVER_INSTRUCTIONS = """\
+You are connected to NetHack through this MCP server.
+
+## NetHack Commands (short):
+
+- **Direction**: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)
+- **Move one step**: [direction]
+- **Move far**: [DIR] (uppercase)
+- **Move silent**: m+[direction]
+- **Pick up**: ,
+- **Drop**: d
+- **Fight**: f+[dir]
+- **Look**: :
+- **Search**: s
+- **Wait/Rest**: .
+- **Inventory**: i
+- **Equipment**: *
+- **Status**: ^X (Ctrl+x)
+- **Extended commands**: #command
+- **Help**: ?
+
+## Workflow:
+
+1. Start a game with nethack_start
+2. Use nethack_move to send commands
+3. Check screen state with nethack_state to see what's happening
+4. Stop with nethack_stop when done
+"""
+
+
+# ============================================================================
+# NetHack client
+# ============================================================================
 
 
 class NetHackClient:
     """Handles communication with NetHack."""
     
     def __init__(self):
-        self.process: subprocess.Process | None = None
+        self.process: Any = None
         self.game_state: dict = {}
         
     def start_game(self, character: str = "human") -> dict:
         """Start a new NetHack game."""
-        # NetHack command - adjust path as needed
         cmd = ["nethack", "-u", character]
         
         self.process = subprocess.Popen(
@@ -32,7 +72,6 @@ class NetHackClient:
             bufsize=1
         )
         
-        # Initial screen state
         self.game_state = {
             "status": "started",
             "screen": "",
@@ -46,30 +85,25 @@ class NetHackClient:
         if not self.process:
             return {"error": "Game not started. Call start_game first."}
         
-        # Send command
         self.process.stdin.write(command + "\n")
         self.process.stdin.flush()
         
-        # Read ALL output until we see the prompt (">") indicating turn is over
         try:
-            import time
             import select
+            import time
             
             output_lines = []
             while True:
-                # Wait for data with timeout
                 readable, _, _ = select.select([self.process.stdout], [], [], 2.0)
                 if readable:
                     line = self.process.stdout.readline()
                     if line:
                         output_lines.append(line)
-                        # Stop when we see the command prompt (end of turn)
                         if line.rstrip().endswith(">"):
                             break
                     else:
                         break
                 else:
-                    # Timeout - something went wrong
                     break
             
             output = "".join(output_lines)
@@ -77,40 +111,16 @@ class NetHackClient:
                 "status": "playing",
                 "command": command,
                 "response": output,
-                "screen": self._extract_screen(output),
+                "screen": output,
                 "full_output": output
             }
             return self.game_state
         except Exception as e:
             return {"error": str(e)}
     
-    def _extract_screen(self, output: str) -> str:
-        """Extract screen state from output."""
-        # This is simplified - real implementation would parse NetHack output
-        return output
-    
     def get_state(self) -> dict:
         """Get current game state."""
         return self.game_state
-    
-    def _read_initial_screen(self) -> str:
-        """Read initial screen after starting game."""
-        import time
-        time.sleep(0.2)
-        try:
-            output_lines = []
-            while True:
-                try:
-                    line = self.process.stdout.readline()
-                    if line:
-                        output_lines.append(line)
-                    else:
-                        break
-                except:
-                    break
-            return "".join(output_lines)
-        except:
-            return ""
     
     def stop_game(self) -> dict:
         """Stop the current game."""
@@ -121,17 +131,17 @@ class NetHackClient:
         return {"error": "No game running"}
 
 
-app = Server("nethack")
+server = Server("nethack-mcp")
 
 
-@app.list_tools()
-async def list_tools() -> list[dict[str, Any]]:
-    """List available tools for playing NetHack."""
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    """List available NetHack tools."""
     return [
-        {
-            "name": "nethack_start",
-            "description": "Start a new NetHack game with specified character",
-            "inputSchema": {
+        types.Tool(
+            name="nethack_start",
+            description="Start a new NetHack game with specified character",
+            inputSchema={
                 "type": "object",
                 "properties": {
                     "character": {
@@ -141,11 +151,11 @@ async def list_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["character"]
             }
-        },
-        {
-            "name": "nethack_move",
-            "description": "Send a move/command to NetHack (direction or action)\n\n## NetHack Commands (short):\n- Direction: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)\n- Move: [direction], Move far: [DIR], Move silent: m+[direction]\n- Pick up: ,  Drop: d  Fight: f+[dir]\n- Look: :  Search: s  Wait/Rest: .\n- Inventory: i  Equipment: *  Status: ^X\n- Extended: #command  Help: ?",
-            "inputSchema": {
+        ),
+        types.Tool(
+            name="nethack_move",
+            description="Send a move/command to NetHack (direction or action)\n\n## NetHack Commands (short):\n- Direction: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)\n- Move: [direction], Move far: [DIR], Move silent: m+[direction]\n- Pick up: ,  Drop: d  Fight: f+[dir]\n- Look: :  Search: s  Wait/Rest: .\n- Inventory: i  Equipment: *  Status: ^X\n- Extended: #command  Help: ?",
+            inputSchema={
                 "type": "object",
                 "properties": {
                     "command": {
@@ -155,89 +165,89 @@ async def list_tools() -> list[dict[str, Any]]:
                 },
                 "required": ["command"]
             }
-        },
-        {
-            "name": "nethack_state",
-            "description": "Get current game state",
-            "inputSchema": {
+        ),
+        types.Tool(
+            name="nethack_state",
+            description="Get current game state",
+            inputSchema={
                 "type": "object",
                 "properties": {}
             }
-        },
-        {
-            "name": "nethack_stop",
-            "description": "Stop current NetHack game",
-            "inputSchema": {
+        ),
+        types.Tool(
+            name="nethack_stop",
+            description="Stop current NetHack game",
+            inputSchema={
                 "type": "object",
                 "properties": {}
             }
-        }
+        )
     ]
 
 
-@app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+@server.call_tool()
+async def handle_call_tool(
+    name: str, arguments: dict[str, Any]
+) -> list[types.TextContent]:
     """Call a NetHack tool."""
     client = NetHackClient()
     
-    if name == "nethack_start":
-        character = arguments.get("character", "human")
-        result = await asyncio.to_thread(client.start_game, character)
-        result["screen"] = client._read_initial_screen()
-        return result
+    try:
+        if name == "nethack_start":
+            character = arguments.get("character", "human")
+            result = await asyncio.to_thread(client.start_game, character)
+            result["screen"] = result.get("full_output", "")
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+        
+        elif name == "nethack_move":
+            command = arguments.get("command")
+            if not command:
+                return [types.TextContent(type="text", text="Error: Command is required")]
+            result = await asyncio.to_thread(client.send_command, command)
+            result["screen"] = result.get("full_output", "")
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+        
+        elif name == "nethack_state":
+            state = await asyncio.to_thread(client.get_state)
+            state["screen"] = state.get("full_output", "")
+            return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
+        
+        elif name == "nethack_stop":
+            result = await asyncio.to_thread(client.stop_game)
+            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+        
+        else:
+            return [types.TextContent(type="text", text=f"Error: Unknown tool: {name}")]
     
-    elif name == "nethack_move":
-        command = arguments.get("command")
-        if not command:
-            return {"error": "Command is required"}
-        result = await asyncio.to_thread(client.send_command, command)
-        result["screen"] = client._extract_screen(result.get("full_output", ""))
-        return result
-    
-    elif name == "nethack_state":
-        state = await asyncio.to_thread(client.get_state)
-        state["screen"] = client._extract_screen(state.get("full_output", ""))
-        return state
-    
-    elif name == "nethack_stop":
-        return await asyncio.to_thread(client.stop_game)
-    
-    else:
-        return {"error": f"Unknown tool: {name}"}
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
 
 
-async def main():
-    """Run the MCP server via stdio."""
-    from mcp.server.models import InitializeResult
-    
-    # Build capabilities
-    tools = await list_tools()
-    tool_names = [t["name"] for t in tools]
-    
-    capabilities = {
-        "tools": {
-            "listChanged": True
-        }
-    }
-    
-    await app.run(
-        StdioServerParameters(
-            command="python3",
-            args=["-m", "nethackmcp.server"],
-            env=None
-        ),
-        initialization_options=InitializationOptions(
-            server_name="nethack",
-            server_version="0.1.0",
-            capabilities=capabilities
-        )
+async def run() -> None:
+    """Start the MCP server on stdio."""
+    caps = server.get_capabilities(
+        notification_options=NotificationOptions(),
+        experimental_capabilities={},
     )
+    caps.tools = types.ToolsCapability(listChanged=True)
+    
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="nethack-mcp",
+                server_version="0.1.0",
+                capabilities=caps,
+                instructions=SERVER_INSTRUCTIONS,
+            ),
+        )
 
 
-def run():
-    """Entry point for the CLI."""
-    asyncio.run(main())
+def main() -> None:
+    """CLI entry point."""
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
-    run()
+    main()
