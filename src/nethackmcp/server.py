@@ -1,7 +1,7 @@
 """MCP server for playing NetHack."""
 
 from mcp.server import Server
-from mcp import StdioServerParameters
+from mcp import StdioServerParameters, InitializationOptions
 import asyncio
 import subprocess
 import json
