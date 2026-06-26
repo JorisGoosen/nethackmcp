@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pty
 import subprocess
 import sys
+import os
 from typing import Any
 
 import mcp.server.stdio
@@ -63,14 +65,20 @@ class NetHackClient:
         """Start a new NetHack game."""
         cmd = ["nethack", "-u", character]
         
+        # Use pty for proper terminal output (curses support)
+        self.master_fd, self.slave_fd = pty.openpty()
+        
         self.process = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
+            stdin=self.slave_fd,
+            stdout=self.slave_fd,
+            stderr=self.slave_fd,
+            text=False,  # Binary mode for pty
+            bufsize=0,
+            close_fds=True
         )
+        
+        os.close(self.slave_fd)
         
         self.game_state = {
             "status": "started",
@@ -85,38 +93,50 @@ class NetHackClient:
         if not self.process:
             return {"error": "Game not started. Call start_game first."}
         
-        self.process.stdin.write(command + "\n")
-        self.process.stdin.flush()
-        
+        # Write command to pty
         try:
             import select
             import time
             
-            output_lines = []
+            # Send command
+            os.write(self.master_fd, (command + "\n").encode())
+            
+            # Read output from pty
+            output_bytes = b""
             while True:
-                readable, _, _ = select.select([self.process.stdout], [], [], 2.0)
+                readable, _, _ = select.select([self.master_fd], [], [], 2.0)
                 if readable:
-                    line = self.process.stdout.readline()
-                    if line:
-                        output_lines.append(line)
-                        if line.rstrip().endswith(">"):
+                    chunk = os.read(self.master_fd, 4096)
+                    if chunk:
+                        output_bytes += chunk
+                        # Check if we see the prompt
+                        if b">" in chunk:
                             break
                     else:
                         break
                 else:
                     break
             
-            output = "".join(output_lines)
+            # Decode and strip ANSI codes
+            output = output_bytes.decode('utf-8', errors='replace')
+            screen = self._strip_ansi(output)
+            
             self.game_state = {
                 "status": "playing",
                 "command": command,
                 "response": output,
-                "screen": output,
+                "screen": screen,
                 "full_output": output
             }
             return self.game_state
         except Exception as e:
             return {"error": str(e)}
+    
+    def _strip_ansi(self, text: str) -> str:
+        """Strip ANSI escape codes from text."""
+        import re
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
     
     def get_state(self) -> dict:
         """Get current game state."""
@@ -127,6 +147,8 @@ class NetHackClient:
         if self.process:
             self.process.terminate()
             self.process = None
+            if hasattr(self, 'master_fd'):
+                os.close(self.master_fd)
             return {"status": "stopped"}
         return {"error": "No game running"}
 
