@@ -60,8 +60,6 @@ class NetHackClient:
     STATE_FILE_PREFIX = "/tmp/nethack_state_"
 
     def __init__(self):
-
-    def __init__(self):
         self.session_name: str | None = None
         self.state_file: str | None = None
         self.game_state: dict[str, Any] = {}
