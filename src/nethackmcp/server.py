@@ -357,8 +357,9 @@ async def handle_call_tool(
             screen_output = result.get("screen", result.get("message", ""))
             if screen_output:
                 print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
-            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(result, indent=2)}"
-            return [types.TextContent(type="text", text=response_text)]
+            # Return just the screen output for opencode to display
+            text_output = screen_output if screen_output else json.dumps(result, indent=2)
+            return [types.TextContent(type="text", text=f"=== STARTED ===\n{text_output}")]
 
         elif name == "nethack_move":
             command = arguments.get("command")
@@ -367,7 +368,7 @@ async def handle_call_tool(
                 print(f"[AI CALL RESULT] {name}: ERROR - {json.dumps(error_result)}", file=sys.stderr, flush=True)
                 return [
                     types.TextContent(
-                        type="text", text=f"=== ERROR ===\n{json.dumps(error_result, indent=2)}"
+                        type="text", text=f"ERROR: {json.dumps(error_result, indent=2)}"
                     )
                 ]
             result = await asyncio.to_thread(client.send_command, command)
@@ -375,8 +376,7 @@ async def handle_call_tool(
             screen_output = result.get("screen", "")
             if screen_output:
                 print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
-            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(result, indent=2)}"
-            return [types.TextContent(type="text", text=response_text)]
+            return [types.TextContent(type="text", text=screen_output if screen_output else json.dumps(result, indent=2))]
 
         elif name == "nethack_state":
             state = await asyncio.to_thread(client.get_state)
@@ -384,18 +384,17 @@ async def handle_call_tool(
             screen_output = state.get("screen", "")
             if screen_output:
                 print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
-            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(state, indent=2)}"
-            return [types.TextContent(type="text", text=response_text)]
+            return [types.TextContent(type="text", text=screen_output if screen_output else json.dumps(state, indent=2))]
 
         elif name == "nethack_stop":
             result = await asyncio.to_thread(client.stop_game)
             print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-            return [types.TextContent(type="text", text=f"=== STOPPED ===\n{json.dumps(result, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Stopped: {json.dumps(result, indent=2)}")]
 
         else:
             error_result = {"error": f"Unknown tool: {name}"}
             print(f"[AI CALL RESULT] {name}: ERROR - {json.dumps(error_result)}", file=sys.stderr, flush=True)
-            return [types.TextContent(type="text", text=f"=== ERROR ===\n{json.dumps(error_result, indent=2)}")]
+            return [types.TextContent(type="text", text=f"Error: {json.dumps(error_result, indent=2)}")]
 
     except Exception as e:
         import traceback
@@ -405,7 +404,7 @@ async def handle_call_tool(
         return [
             types.TextContent(
                 type="text",
-                text=f"=== EXCEPTION ===\n{json.dumps(error_result, indent=2)}",
+                text=f"Exception: {json.dumps(error_result, indent=2)}",
             )
         ]
 
