@@ -345,45 +345,67 @@ async def handle_call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
     """Call a NetHack tool."""
+    print(f"[AI CALL] Tool: {name}, Arguments: {json.dumps(arguments)}", file=sys.stderr, flush=True)
+    
     client = NetHackClient()
 
     try:
         if name == "nethack_start":
             character = arguments.get("character", "human")
             result = await asyncio.to_thread(client.start_game, character)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
+            screen_output = result.get("screen", result.get("message", ""))
+            if screen_output:
+                print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
+            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(result, indent=2)}"
+            return [types.TextContent(type="text", text=response_text)]
 
         elif name == "nethack_move":
             command = arguments.get("command")
             if not command:
+                error_result = {"error": "Command is required"}
+                print(f"[AI CALL RESULT] {name}: ERROR - {json.dumps(error_result)}", file=sys.stderr, flush=True)
                 return [
                     types.TextContent(
-                        type="text", text=json.dumps({"error": "Command is required"}, indent=2)
+                        type="text", text=f"=== ERROR ===\n{json.dumps(error_result, indent=2)}"
                     )
                 ]
             result = await asyncio.to_thread(client.send_command, command)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
+            screen_output = result.get("screen", "")
+            if screen_output:
+                print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
+            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(result, indent=2)}"
+            return [types.TextContent(type="text", text=response_text)]
 
         elif name == "nethack_state":
             state = await asyncio.to_thread(client.get_state)
-            return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
+            print(f"[AI CALL RESULT] {name}: {json.dumps(state)}", file=sys.stderr, flush=True)
+            screen_output = state.get("screen", "")
+            if screen_output:
+                print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
+            response_text = f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===\n\n=== JSON RESPONSE ===\n{json.dumps(state, indent=2)}"
+            return [types.TextContent(type="text", text=response_text)]
 
         elif name == "nethack_stop":
             result = await asyncio.to_thread(client.stop_game)
-            return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
+            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
+            return [types.TextContent(type="text", text=f"=== STOPPED ===\n{json.dumps(result, indent=2)}")]
 
         else:
-            return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, indent=2))]
+            error_result = {"error": f"Unknown tool: {name}"}
+            print(f"[AI CALL RESULT] {name}: ERROR - {json.dumps(error_result)}", file=sys.stderr, flush=True)
+            return [types.TextContent(type="text", text=f"=== ERROR ===\n{json.dumps(error_result, indent=2)}")]
 
     except Exception as e:
         import traceback
 
+        error_result = {"error": str(e), "traceback": traceback.format_exc()}
+        print(f"[AI CALL RESULT] {name}: EXCEPTION - {json.dumps(error_result)}", file=sys.stderr, flush=True)
         return [
             types.TextContent(
                 type="text",
-                text=json.dumps(
-                    {"error": str(e), "traceback": traceback.format_exc()}, indent=2
-                ),
+                text=f"=== EXCEPTION ===\n{json.dumps(error_result, indent=2)}",
             )
         ]
 
