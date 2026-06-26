@@ -61,9 +61,9 @@ class NetHackClient:
         self.process: Any = None
         self.game_state: dict = {}
         
-    def start_game(self, character: str = "human") -> dict:
-        """Start a new NetHack game."""
-        cmd = ["nethack", "-u", character]
+    def start_game(self, character: str = "random") -> dict:
+        """Start a new NetHack game with random character."""
+        cmd = ["nethack", "-r"]
         
         # Use pty for proper terminal output (curses support)
         self.master_fd, self.slave_fd = pty.openpty()
@@ -83,7 +83,7 @@ class NetHackClient:
         self.game_state = {
             "status": "started",
             "screen": "",
-            "message": "Game started. Waiting for first screen..."
+            "message": "Game started with random character. Waiting for screen..."
         }
         
         return self.game_state
