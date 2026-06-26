@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pty
+import os
+import re
+import select
 import subprocess
 import sys
-import os
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
 import mcp.server.stdio
 import mcp.types as types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
-
-# ============================================================================
-# Server instructions — shown to the AI client to guide usage
-# ============================================================================
 
 SERVER_INSTRUCTIONS = """\
 You are connected to NetHack through this MCP server.
@@ -46,111 +46,226 @@ You are connected to NetHack through this MCP server.
 2. Use nethack_move to send commands
 3. Check screen state with nethack_state to see what's happening
 4. Stop with nethack_stop when done
+
+## Important:
+
+The server maintains game state using tmux sessions. Each game gets its own tmux session.
 """
 
 
-# ============================================================================
-# NetHack client
-# ============================================================================
-
-
 class NetHackClient:
-    """Handles communication with NetHack."""
-    
+    """Handles NetHack game using persistent tmux sessions."""
+
+    TMUX_SESSION_PREFIX = "nethack_"
+    STATE_FILE_PREFIX = "/tmp/nethack_state_"
+
     def __init__(self):
-        self.process: Any = None
-        self.game_state: dict = {}
+
+    def __init__(self):
+        self.session_name: str | None = None
+        self.state_file: str | None = None
+        self.game_state: dict[str, Any] = {}
         
-    def start_game(self, character: str = "random") -> dict:
-        """Start a new NetHack game with random character."""
-        cmd = ["nethack", "-r"]
-        
-        # Use pty for proper terminal output (curses support)
-        self.master_fd, self.slave_fd = pty.openpty()
-        
-        self.process = subprocess.Popen(
-            cmd,
-            stdin=self.slave_fd,
-            stdout=self.slave_fd,
-            stderr=self.slave_fd,
-            text=False,  # Binary mode for pty
-            bufsize=0,
-            close_fds=True
-        )
-        
-        os.close(self.slave_fd)
-        
-        self.game_state = {
-            "status": "started",
-            "screen": "",
-            "message": "Game started with random character. Waiting for screen..."
-        }
-        
-        return self.game_state
-    
-    def send_command(self, command: str) -> dict:
-        """Send a command to NetHack."""
-        if not self.process:
-            return {"error": "Game not started. Call start_game first."}
-        
-        # Write command to pty
-        try:
-            import select
-            import time
-            
-            # Send command
-            os.write(self.master_fd, (command + "\n").encode())
-            
-            # Read output from pty
-            output_bytes = b""
-            while True:
-                readable, _, _ = select.select([self.master_fd], [], [], 2.0)
-                if readable:
-                    chunk = os.read(self.master_fd, 4096)
-                    if chunk:
-                        output_bytes += chunk
-                        # Check if we see the prompt
-                        if b">" in chunk:
-                            break
-                    else:
-                        break
-                else:
-                    break
-            
-            # Decode and strip ANSI codes
-            output = output_bytes.decode('utf-8', errors='replace')
-            screen = self._strip_ansi(output)
-            
-            self.game_state = {
-                "status": "playing",
-                "command": command,
-                "response": output,
-                "screen": screen,
-                "full_output": output
-            }
-            return self.game_state
-        except Exception as e:
-            return {"error": str(e)}
-    
+        # Check for existing state from previous run
+        existing_state = self._find_existing_state()
+        if existing_state:
+            try:
+                with open(existing_state, "r") as f:
+                    state = json.load(f)
+                    self.session_name = state.get("session_name")
+                    self.state_file = existing_state
+                    self.game_state = state
+            except Exception:
+                pass
+
     def _strip_ansi(self, text: str) -> str:
         """Strip ANSI escape codes from text."""
-        import re
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_escape.sub('', text)
-    
-    def get_state(self) -> dict:
-        """Get current game state."""
-        return self.game_state
-    
-    def stop_game(self) -> dict:
+        ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+        return ansi_escape.sub("", text)
+
+    def _find_existing_state(self) -> str | None:
+        """Find existing state file from previous game."""
+        import glob
+
+        state_files = glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
+        if state_files:
+            return state_files[0]
+        return None
+
+    def _get_session_name(self) -> str:
+        """Get or create a tmux session name."""
+        if self.session_name is None:
+            state_file = self._find_existing_state()
+            if state_file:
+                try:
+                    with open(state_file, "r") as f:
+                        state = json.load(f)
+                        self.session_name = state.get("session_name")
+                        self.state_file = state_file
+                        return self.session_name
+                except Exception:
+                    pass
+
+            import random
+            import string
+
+            suffix = "".join(random.choices(string.ascii_lowercase, k=8))
+            self.session_name = f"{self.TMUX_SESSION_PREFIX}{suffix}"
+            self.state_file = None
+        return self.session_name
+
+    def _get_state_file(self) -> str:
+        """Get or create a state file path."""
+        if self.state_file is None:
+            state_file = self._find_existing_state()
+            if state_file:
+                self.state_file = state_file
+                return state_file
+
+            import random
+            import string
+
+            suffix = "".join(random.choices(string.ascii_lowercase, k=8))
+            self.state_file = f"{self.STATE_FILE_PREFIX}{suffix}.json"
+        return self.state_file
+
+    def start_game(self, character: str = "random") -> dict[str, Any]:
+        """Start a new NetHack game."""
+        session_name = self._get_session_name()
+        state_file = self._get_state_file()
+
+        # Clean up any existing session
+        self.stop_game()
+
+        # Create tmux session with NetHack
+        cmd = [
+            "tmux",
+            "new-session",
+            "-d",
+            "-s",
+            session_name,
+            "nethack",
+        ]
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            return {"error": f"Failed to start tmux session: {e}", "status": "error"}
+
+        # Wait a moment for NetHack to start
+        time.sleep(1)
+
+        # Write initial state
+        state = {
+            "status": "started",
+            "screen": "",
+            "full_output": "",
+            "message": "Game started with random character.",
+            "session_name": session_name,
+            "state_file": state_file,
+        }
+
+        try:
+            with open(state_file, "w") as f:
+                json.dump(state, f)
+        except Exception as e:
+            self.stop_game()
+            return {"error": f"Failed to write state file: {e}", "status": "error"}
+
+        self.session_name = session_name
+        self.state_file = state_file
+        self.game_state = state
+
+        # Read and return screen content
+        time.sleep(0.5)
+        state = self.get_state()
+        # Update status to started after getting initial screen
+        state["status"] = "started"
+        state["message"] = "Game started with random character. Waiting for character selection..."
+        return state
+
+    def send_command(self, command: str) -> dict[str, Any]:
+        """Send a command to NetHack."""
+        if self.session_name is None:
+            return {"error": "Game not started. Call start_game first.", "status": "error"}
+
+        try:
+            # Send command followed by enter
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self.session_name, command, "Enter"],
+                check=True,
+                capture_output=True,
+            )
+
+            # Wait for NetHack to process
+            time.sleep(0.5)
+
+            return self.get_state()
+
+        except subprocess.CalledProcessError as e:
+            return {"error": f"Failed to send command: {e}", "status": "error"}
+
+    def get_state(self) -> dict[str, Any]:
+        """Get current game state from tmux."""
+        if self.session_name is None:
+            return {"error": "Game not started. Call start_game first.", "status": "error"}
+
+        try:
+            # Get tmux buffer content
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", self.session_name, "-p", "-S", "-100"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            screen_text = self._strip_ansi(result.stdout)
+
+            state = {
+                "status": "playing",
+                "screen": screen_text,
+                "full_output": screen_text,
+                "session_name": self.session_name,
+            }
+
+            # Update state file
+            if self.state_file:
+                try:
+                    state["state_file"] = self.state_file
+                    with open(self.state_file, "w") as f:
+                        json.dump(state, f)
+                except Exception:
+                    pass
+
+            self.game_state = state
+            return state
+
+        except subprocess.CalledProcessError as e:
+            return {"error": f"Failed to get state: {e}", "status": "error"}
+
+    def stop_game(self) -> dict[str, Any]:
         """Stop the current game."""
-        if self.process:
-            self.process.terminate()
-            self.process = None
-            if hasattr(self, 'master_fd'):
-                os.close(self.master_fd)
-            return {"status": "stopped"}
-        return {"error": "No game running"}
+        try:
+            if self.session_name:
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", self.session_name],
+                    check=True,
+                    capture_output=True,
+                )
+        except subprocess.CalledProcessError:
+            pass
+
+        try:
+            if self.state_file and os.path.exists(self.state_file):
+                os.remove(self.state_file)
+        except Exception:
+            pass
+
+        self.session_name = None
+        self.state_file = None
+        self.game_state = {}
+
+        return {"status": "stopped"}
 
 
 server = Server("nethack-mcp")
@@ -162,48 +277,42 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="nethack_start",
-            description="Start a new NetHack game with specified character",
+            description="Start a new NetHack game",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "character": {
                         "type": "string",
-                        "description": "Character name (e.g., 'human', 'elf', 'dwarf')"
+                        "description": "Character name (optional, defaults to random)",
                     }
                 },
-                "required": ["character"]
-            }
+                "required": [],
+            },
         ),
         types.Tool(
             name="nethack_move",
-            description="Send a move/command to NetHack (direction or action)\n\n## NetHack Commands (short):\n- Direction: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)\n- Move: [direction], Move far: [DIR], Move silent: m+[direction]\n- Pick up: ,  Drop: d  Fight: f+[dir]\n- Look: :  Search: s  Wait/Rest: .\n- Inventory: i  Equipment: *  Status: ^X\n- Extended: #command  Help: ?",
+            description="Send a move/command to NetHack",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Command to send (movement keys, actions, or extended commands starting with #)"
+                        "description": "Command to send (movement keys, actions, or extended commands)",
                     }
                 },
-                "required": ["command"]
-            }
+                "required": ["command"],
+            },
         ),
         types.Tool(
             name="nethack_state",
             description="Get current game state",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
+            inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="nethack_stop",
             description="Stop current NetHack game",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        )
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -213,36 +322,46 @@ async def handle_call_tool(
 ) -> list[types.TextContent]:
     """Call a NetHack tool."""
     client = NetHackClient()
-    
+
     try:
         if name == "nethack_start":
             character = arguments.get("character", "human")
             result = await asyncio.to_thread(client.start_game, character)
-            result["screen"] = result.get("full_output", "")
             return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
+
         elif name == "nethack_move":
             command = arguments.get("command")
             if not command:
-                return [types.TextContent(type="text", text="Error: Command is required")]
+                return [
+                    types.TextContent(
+                        type="text", text=json.dumps({"error": "Command is required"}, indent=2)
+                    )
+                ]
             result = await asyncio.to_thread(client.send_command, command)
-            result["screen"] = result.get("full_output", "")
             return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
+
         elif name == "nethack_state":
             state = await asyncio.to_thread(client.get_state)
-            state["screen"] = state.get("full_output", "")
             return [types.TextContent(type="text", text=json.dumps(state, indent=2))]
-        
+
         elif name == "nethack_stop":
             result = await asyncio.to_thread(client.stop_game)
             return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
-        
+
         else:
-            return [types.TextContent(type="text", text=f"Error: Unknown tool: {name}")]
-    
+            return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}, indent=2))]
+
     except Exception as e:
-        return [types.TextContent(type="text", text=f"Error: {e}")]
+        import traceback
+
+        return [
+            types.TextContent(
+                type="text",
+                text=json.dumps(
+                    {"error": str(e), "traceback": traceback.format_exc()}, indent=2
+                ),
+            )
+        ]
 
 
 async def run() -> None:
@@ -252,7 +371,7 @@ async def run() -> None:
         experimental_capabilities={},
     )
     caps.tools = types.ToolsCapability(listChanged=True)
-    
+
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
