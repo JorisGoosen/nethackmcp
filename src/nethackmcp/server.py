@@ -135,14 +135,19 @@ class NetHackClient:
         # Clean up any existing session
         self.stop_game()
 
-        # Create tmux session with NetHack
+        # Create tmux session with NetHack running in a loop
+        # NetHack exits when stdin closes, so we wrap it to keep it running
         cmd = [
             "tmux",
             "new-session",
             "-d",
             "-s",
             session_name,
-            "nethack",
+            "-x", "80",
+            "-y", "24",
+            "bash",
+            "-c",
+            "while true; do nethack; sleep 1; done",
         ]
 
         try:
@@ -151,14 +156,26 @@ class NetHackClient:
             return {"error": f"Failed to start tmux session: {e}", "status": "error"}
 
         # Wait a moment for NetHack to start
-        time.sleep(1)
+        time.sleep(2)
+
+        # Verify tmux session was created
+        check_result = subprocess.run(
+            ["tmux", "has-session", "-t", session_name],
+            capture_output=True,
+            text=True,
+        )
+        if check_result.returncode != 0:
+            return {
+                "error": f"tmux session '{session_name}' was not created. Is NetHack installed and in PATH?",
+                "status": "error"
+            }
 
         # Write initial state
         state = {
             "status": "started",
             "screen": "",
             "full_output": "",
-            "message": "Game started with random character.",
+            "message": "Game started with random character. Waiting for character selection...",
             "session_name": session_name,
             "state_file": state_file,
         }
@@ -207,6 +224,15 @@ class NetHackClient:
         """Get current game state from tmux."""
         if self.session_name is None:
             return {"error": "Game not started. Call start_game first.", "status": "error"}
+
+        # Check if tmux session exists
+        check_result = subprocess.run(
+            ["tmux", "has-session", "-t", self.session_name],
+            capture_output=True,
+            text=True,
+        )
+        if check_result.returncode != 0:
+            return {"error": f"tmux session '{self.session_name}' not found", "status": "error"}
 
         try:
             # Get tmux buffer content
