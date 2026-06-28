@@ -88,6 +88,37 @@ class NetHackClient:
         stripped = ansi_escape.sub("", text)
         return stripped, text
 
+    def _create_diff(self, current: list[str], previous: list[str]) -> str:
+        """Create character-by-character diff showing changes."""
+        max_lines = max(len(current), len(previous))
+        max_width = max(
+            max(len(line) for line in current) if current else 0,
+            max(len(line) for line in previous) if previous else 0
+        )
+        
+        diff_lines = []
+        for row in range(max_lines):
+            current_line = current[row] if row < len(current) else ""
+            previous_line = previous[row] if row < len(previous) else ""
+            
+            diff_row = []
+            has_changes = False
+            for col in range(max_width):
+                current_char = current_line[col] if col < len(current_line) else " "
+                previous_char = previous_line[col] if col < len(previous_line) else " "
+                
+                if current_char != previous_char:
+                    diff_row.append(current_char)
+                    has_changes = True
+                else:
+                    diff_row.append(" ")
+            
+            diff_line = "".join(diff_row).rstrip()
+            if has_changes and diff_line:
+                diff_lines.append(diff_line)
+        
+        return "\n".join(diff_lines)
+
     def _find_existing_state(self) -> str | None:
         """Find existing state file from previous game."""
         import glob
@@ -211,6 +242,11 @@ class NetHackClient:
         if self.session_name is None:
             return {"error": "Game not started. Call start_game first.", "status": "error"}
 
+        current_state = self.get_state()
+        full_output = current_state.get("full_output", "")
+        self.previous_screen = full_output
+        self.previous_stripped_screen = full_output.split("\n")
+
         try:
             # Handle special key names that tmux understands
             special_keys = {
@@ -248,7 +284,27 @@ class NetHackClient:
             # Wait for NetHack to process
             time.sleep(0.5)
 
-            return self.get_state()
+            state = self.get_state()
+            
+            if self.state_file:
+                try:
+                    with open(self.state_file, "r") as f:
+                        saved_state = json.load(f)
+                    saved_state["previous_screen"] = self.previous_screen
+                    saved_state["previous_stripped_screen"] = self.previous_stripped_screen
+                    with open(self.state_file, "w") as f:
+                        json.dump(saved_state, f)
+                except Exception:
+                    pass
+            
+            # Update state with diff if available and add it to the returned state
+            if hasattr(self, 'previous_stripped_screen') and self.previous_stripped_screen is not None:
+                current_stripped = state.get("full_output", "").split("\n")
+                if len(current_stripped) > 0 and current_stripped[0] != "":
+                    diff = self._create_diff(current_stripped, self.previous_stripped_screen)
+                    state["diff"] = diff
+            
+            return state
 
         except subprocess.CalledProcessError as e:
             return {"error": f"Failed to send command: {e}", "status": "error"}
@@ -291,6 +347,18 @@ class NetHackClient:
             return {"error": f"tmux session '{self.session_name}' not found", "status": "error"}
 
         try:
+            # Load previous screen from state file if available (only if not already set)
+            if self.state_file and os.path.exists(self.state_file):
+                try:
+                    with open(self.state_file, "r") as f:
+                        saved_state = json.load(f)
+                    if not hasattr(self, 'previous_screen') or self.previous_screen is None:
+                        self.previous_screen = saved_state.get("previous_screen")
+                    if not hasattr(self, 'previous_stripped_screen') or self.previous_stripped_screen is None:
+                        self.previous_stripped_screen = saved_state.get("previous_stripped_screen", [])
+                except Exception:
+                    pass
+
             # Get exactly what's visible on screen
             result = subprocess.run(
                 ["tmux", "capture-pane", "-t", self.session_name, "-p", "-J"],
@@ -319,6 +387,11 @@ class NetHackClient:
                 "full_output": colored_text,
                 "session_name": self.session_name,
             }
+            
+            # Add diff if previous screen available
+            if hasattr(self, 'previous_stripped_screen') and self.previous_stripped_screen is not None:
+                diff = self._create_diff(screen_lines, self.previous_stripped_screen)
+                state["diff"] = diff
             
             # Add goal at top
             if self.current_goal:
@@ -469,6 +542,11 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["goal"],
             },
         ),
+        types.Tool(
+            name="nethack_diff",
+            description="Get the difference between current and previous screen",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -568,7 +646,6 @@ async def handle_call_tool(
                             "goal_locked_until_counter": 10,
                             "status": "playing"
                         }, f)
-                    print(f"[DEBUG] Saved goal '{goal}' to {client.state_file}", file=sys.stderr, flush=True)
                 except Exception as e:
                     import traceback
                     print(f"[ERROR saving goal]: {e}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
@@ -576,6 +653,12 @@ async def handle_call_tool(
                 print("[WARNING] No state_file available for persisting goal", file=sys.stderr, flush=True)
             print(f"[AI CALL RESULT] {name}: Goal set to '{goal}'", file=sys.stderr, flush=True)
             return [types.TextContent(type="text", text=f"```\nGoal set: {goal}\n```")]
+
+        elif name == "nethack_diff":
+            state = await asyncio.to_thread(client.get_state)
+            diff = state.get("diff", "No diff available")
+            print(f"[AI CALL RESULT] {name}: {diff}", file=sys.stderr, flush=True)
+            return [types.TextContent(type="text", text=f"```\n{diff}\n```")]
 
         else:
             error_result = {"error": f"Unknown tool: {name}"}
