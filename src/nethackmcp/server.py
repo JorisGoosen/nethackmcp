@@ -598,11 +598,14 @@ async def handle_call_tool(
             print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
             screen_output = result.get("screen", "")
             hints = result.get("hints", "")
+            diff = result.get("diff", "")
             if screen_output:
                 print(f"=== SCREEN OUTPUT ===\n{screen_output}\n=== END SCREEN ===", file=sys.stderr, flush=True)
             output = screen_output if screen_output else json.dumps(result, indent=2)
             if hints:
                 output = output + "\n" + hints
+            if diff:
+                output = output + f"\n\n=== DIFF ===\n{diff}"
             return [types.TextContent(type="text", text=f"```\n{output}\n```")]
 
         elif name == "nethack_state":
