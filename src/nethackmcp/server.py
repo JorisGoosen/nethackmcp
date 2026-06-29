@@ -669,17 +669,20 @@ class NetHackClient:
         for y in range(max_y, min_y - 1, -1):  # Y goes from top to bottom
             line = ""
             for x in range(min_x, max_x + 1):
-                tile = current_map.get_tile(x, y)
-                if tile:
-                    # Show as visited if either walked on it (visited=True) or if player is adjacent
-                    if tile.visited or self._is_player_adjacent(current_map, x, y):
-                        # Show terrain for visited/adjacent tiles
-                        line += tile.terrain
-                    else:
-                        # Show passable as '.', impassable as 'X' for unvisited
-                        line += '.' if tile.passable else 'X'
+                # Check if this is the player position
+                if current_map.player_world_pos is not None and x == current_map.player_world_pos[0] and y == current_map.player_world_pos[1]:
+                    line += '@'
                 else:
-                    line += " "
+                    tile = current_map.get_tile(x, y)
+                    if tile:
+                        if tile.visited:
+                            # Show floor for known passable, wall for known impassable
+                            line += '.' if tile.passable else 'X'
+                        else:
+                            # Unknown tiles show '?'
+                            line += '?'
+                    else:
+                        line += " "
             map_lines.append(line)
         
         map_string = "\n".join(map_lines)
