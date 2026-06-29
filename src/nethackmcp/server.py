@@ -19,6 +19,9 @@ import mcp.types as types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
+from nethackmcp.map import DungeonMap, Tile
+from nethackmcp.movement_analyzer import MovementAnalyzer
+
 SERVER_INSTRUCTIONS = """\
 You are connected to NetHack through this MCP server.
 
@@ -67,6 +70,15 @@ class NetHackClient:
         self.goal_locked_until_counter: int = -1
         self.game_state: dict[str, Any] = {}
         
+        # Mapping system
+        self.maps: dict[int, DungeonMap] = {}
+        self.current_level: int = 1
+        self.movement_analyzer = MovementAnalyzer()
+        
+        # Previous screen state for diff
+        self.previous_screen: str | None = None
+        self.previous_stripped_screen: list[str] | None = None
+        
         # Check for existing state from previous run
         existing_state = self._find_existing_state()
         if existing_state:
@@ -78,6 +90,17 @@ class NetHackClient:
                     self.current_goal = state.get("current_goal", "")
                     self.goal_counter = state.get("goal_counter", 0)
                     self.goal_locked_until_counter = state.get("goal_locked_until_counter", -1)
+                    
+                    # Restore maps
+                    maps_data = state.get("maps", {})
+                    for level_str, map_data in maps_data.items():
+                        level = int(level_str)
+                        self.maps[level] = DungeonMap.from_dict(map_data)
+                    
+                    self.current_level = state.get("current_level", 1)
+                    self.previous_screen = state.get("previous_screen")
+                    self.previous_stripped_screen = state.get("previous_stripped_screen", [])
+                    
                     self.game_state = state
             except Exception:
                 pass
@@ -164,6 +187,97 @@ class NetHackClient:
             suffix = "".join(random.choices(string.ascii_lowercase, k=8))
             self.state_file = f"{self.STATE_FILE_PREFIX}{suffix}.json"
         return self.state_file
+
+    def _extract_level_from_status(self, screen_lines: list[str]) -> int | None:
+        """Extract current dungeon level from status bar."""
+        for line in screen_lines:
+            # Look for "Dlvl:" pattern
+            match = re.search(r"Dlvl:\s*(\d+)", line)
+            if match:
+                return int(match.group(1))
+        return None
+    
+    def _detect_level_change(self, screen_lines: list[str]) -> bool:
+        """Check if player moved between dungeon levels."""
+        current_level = self._extract_level_from_status(screen_lines)
+        if current_level is not None and current_level != self.current_level:
+            return True
+        return False
+    
+    def _update_map_from_screen(self, screen_lines: list[str], player_row: int, player_col: int) -> dict[str, Any]:
+        """Update the map based on current screen. Returns movement analysis result."""
+        result = {
+            "player_world_pos": None,
+            "map_updated": False,
+            "player_moved_world": False,
+            "screen_shifted": False,
+        }
+        
+        # Get or create map for current level
+        if self.current_level not in self.maps:
+            self.maps[self.current_level] = DungeonMap(level=self.current_level)
+        
+        current_map = self.maps[self.current_level]
+        
+        # Analyze movement
+        if self.previous_stripped_screen is not None:
+            movement_result = self.movement_analyzer.analyze(
+                screen_lines, self.previous_stripped_screen
+            )
+            
+            result["screen_shifted"] = movement_result.get("screen_shifted", False)
+            result["player_moved_world"] = movement_result.get("player_moved_world", False)
+            
+            # Handle screen shift
+            if movement_result.get("screen_shifted"):
+                # Screen scrolled, map moved
+                # Player world position stays same, but screen offset changes
+                # This is complex - for now, assume screen shift means player didn't move
+                pass
+            elif movement_result.get("player_moved"):
+                # Player moved in world coordinates
+                player_delta = movement_result.get("player_delta", (0, 0))
+                if current_map.player_world_pos:
+                    new_x = current_map.player_world_pos[0] + player_delta[1]  # delta_col -> x
+                    new_y = current_map.player_world_pos[1] + player_delta[0]  # delta_row -> y
+                    current_map.set_player_position(new_x, new_y)
+                    result["player_world_pos"] = (new_x, new_y)
+                    result["map_updated"] = True
+        
+        # Extract terrain from screen (filter out status bars)
+        # NetHack screen layout:
+        # - Lines 0-5: title/status messages (e.g., "m - an ivory ring", "You are lucky!")
+        # - Lines 6-15: dungeon game area (what we map)
+        # - Lines 16+: status bar (player stats, Dlvl, HP, etc.)
+        game_start = 6
+        game_end = 15
+        
+        # Use center of game area as (0,0)
+        game_area_lines = screen_lines[game_start:game_end+1]
+        screen_center_row = len(game_area_lines) // 2
+        screen_center_col = max(len(line) for line in game_area_lines) // 2 if game_area_lines else 40
+        
+        for row in range(game_start, game_end + 1):
+            if row < len(screen_lines):
+                line = screen_lines[row]
+                for col, char in enumerate(line):
+                    if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
+                        # Convert screen pos to world pos relative to game area center
+                        # Adjust row to be relative to game area start
+                        relative_row = row - game_start
+                        world_x = col - screen_center_col
+                        world_y = relative_row - screen_center_row
+                        current_map.set_tile(world_x, world_y, char, seen=True)
+        
+        # Mark current player position as visited
+        if player_row >= 0 and player_col >= 0:
+            current_map.player_screen_pos = (player_row, player_col)
+            
+            # Player starts at (0, 0) on each level
+            current_map.set_player_position(0, 0)
+        
+        result["map_updated"] = result["map_updated"] or result["player_moved_world"]
+        return result
 
     def start_game(self, character: str = "random") -> dict[str, Any]:
         """Start a new NetHack game."""
@@ -379,6 +493,17 @@ class NetHackClient:
                         break
                 if player_row >= 0:
                     break
+            
+            # Check for level change
+            new_level = self._extract_level_from_status(screen_lines)
+            if new_level is not None and new_level != self.current_level:
+                self.current_level = new_level
+            
+            # Update map from screen
+            map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
+            
+            # Store previous screen for next diff
+            self.previous_stripped_screen = screen_lines.copy()
 
             # Build state with optional hints - use colored text for screen, stripped for analysis
             state = {
@@ -386,10 +511,23 @@ class NetHackClient:
                 "screen": colored_text,
                 "full_output": colored_text,
                 "session_name": self.session_name,
+                "map": {
+                    "level": self.current_level,
+                    "player_world_pos": self.maps.get(self.current_level, DungeonMap(self.current_level)).player_world_pos,
+                    "explored_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_explored_count(),
+                    "seen_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_seen_count(),
+                    "bounds": self.maps.get(self.current_level, DungeonMap(self.current_level)).bounds,
+                } if self.maps else {
+                    "level": self.current_level,
+                    "player_world_pos": None,
+                    "explored_tiles": 0,
+                    "seen_tiles": 0,
+                    "bounds": {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0},
+                },
             }
             
             # Add diff if previous screen available
-            if hasattr(self, 'previous_stripped_screen') and self.previous_stripped_screen is not None:
+            if self.previous_stripped_screen is not None:
                 diff = self._create_diff(screen_lines, self.previous_stripped_screen)
                 state["diff"] = diff
             
@@ -399,7 +537,6 @@ class NetHackClient:
             
             # Add hints if player position found (use stripped text for tile detection)
             if player_row >= 0:
-                direction_tiles = self._get_direction_tiles(screen_lines, player_row, player_col)
                 hints_lines = [
                     "HINTS",
                     "@ Has the following next tiles behind the movement keys:",
@@ -416,10 +553,37 @@ class NetHackClient:
                     "' ' => rockwall (impassable, YES THE EMPTY SPACE IS IMPASSABLE!)",
                     "'<' => stairs up (impassable)",
                     "",
+                    f"Level: {self.current_level}",
+                    f"Player (world): {self.maps.get(self.current_level, DungeonMap(self.current_level)).player_world_pos}",
+                    f"Explored: {self.maps.get(self.current_level, DungeonMap(self.current_level)).get_explored_count()} tiles",
+                    f"Seen: {self.maps.get(self.current_level, DungeonMap(self.current_level)).get_seen_count()} tiles",
+                    "",
                 ]
+                
+                direction_tiles = self._get_direction_tiles(screen_lines, player_row, player_col)
+                
+                # Screen center is (0,0) in world coordinates
+                screen_center_row = len(screen_lines) // 2
+                screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
+                
                 for key in "hjklynub":
                     tile = direction_tiles.get(key, " ")
-                    hints_lines.append(f"`{key}`:'{tile}'")
+                    
+                    # Check if we have map info for this direction
+                    map_info = ""
+                    current_map = self.maps.get(self.current_level)
+                    if current_map:
+                        row_offset, col_offset = self._get_direction_offset(key)
+                        direction_row = player_row + row_offset
+                        direction_col = player_col + col_offset
+                        world_x = direction_col - screen_center_col
+                        world_y = direction_row - screen_center_row
+                        tile_obj = current_map.get_tile(world_x, world_y)
+                        if tile_obj:
+                            visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
+                            map_info = visited_str
+                    
+                    hints_lines.append(f"`{key}`:'{tile}'{map_info}")
                 
                 blocked_tiles = {' ', '|', '-'}
                 allowed_keys = [key for key, tile in direction_tiles.items() if tile not in blocked_tiles]
@@ -440,10 +604,21 @@ class NetHackClient:
             # Update state file
             if self.state_file:
                 try:
+                    # Save maps to state
+                    maps_data = {
+                        str(level): map_obj.to_dict()
+                        for level, map_obj in self.maps.items()
+                    }
+                    
                     state["state_file"] = self.state_file
                     state["current_goal"] = self.current_goal
                     state["goal_counter"] = self.goal_counter
                     state["goal_locked_until_counter"] = self.goal_locked_until_counter
+                    state["maps"] = maps_data
+                    state["current_level"] = self.current_level
+                    state["previous_screen"] = self.previous_screen
+                    state["previous_stripped_screen"] = self.previous_stripped_screen
+                    
                     with open(self.state_file, "w") as f:
                         json.dump(state, f)
                 except Exception:
@@ -454,6 +629,86 @@ class NetHackClient:
 
         except subprocess.CalledProcessError as e:
             return {"error": f"Failed to get state: {e}", "status": "error"}
+    
+    def _get_direction_offset(self, key: str) -> tuple[int, int]:
+        """Get row/col offset for a direction key."""
+        offsets = {
+            "h": (0, -1),
+            "j": (1, 0),
+            "k": (-1, 0),
+            "l": (0, 1),
+            "y": (-1, -1),
+            "u": (-1, 1),
+            "b": (1, -1),
+            "n": (1, 1),
+        }
+        return offsets.get(key, (0, 0))
+    
+    def _show_map(self) -> dict[str, Any]:
+        """Generate a string representation of the current map."""
+        if self.current_level not in self.maps:
+            return {"error": f"No map data for level {self.current_level}", "status": "error"}
+        
+        current_map = self.maps[self.current_level]
+        
+        # Get bounds
+        min_x = current_map.bounds.get("min_x", 0)
+        max_x = current_map.bounds.get("max_x", 0)
+        min_y = current_map.bounds.get("min_y", 0)
+        max_y = current_map.bounds.get("max_y", 0)
+        
+        # Add some padding
+        padding = 2
+        min_x -= padding
+        max_x += padding
+        min_y -= padding
+        max_y += padding
+        
+        # Build map representation
+        map_lines = []
+        for y in range(max_y, min_y - 1, -1):  # Y goes from top to bottom
+            line = ""
+            for x in range(min_x, max_x + 1):
+                tile = current_map.get_tile(x, y)
+                if tile:
+                    # Show as visited if either walked on it (visited=True) or if player is adjacent
+                    if tile.visited or self._is_player_adjacent(current_map, x, y):
+                        # Show terrain for visited/adjacent tiles
+                        line += tile.terrain
+                    else:
+                        # Show passable as '.', impassable as 'X' for unvisited
+                        line += '.' if tile.passable else 'X'
+                else:
+                    line += " "
+            map_lines.append(line)
+        
+        map_string = "\n".join(map_lines)
+        
+        result = {
+            "map": map_string,
+            "level": self.current_level,
+            "bounds": current_map.bounds,
+            "explored_tiles": current_map.get_explored_count(),
+            "seen_tiles": current_map.get_seen_count(),
+            "status": "success",
+        }
+        
+        return result
+    
+    def _is_player_adjacent(self, current_map: DungeonMap, tile_x: int, tile_y: int) -> bool:
+        """Check if the player is adjacent to the given tile (including diagonals)."""
+        if current_map.player_world_pos is None:
+            return False
+        
+        player_x, player_y = current_map.player_world_pos
+        # Check all 8 surrounding tiles
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                if player_x == tile_x + dx and player_y == tile_y + dy:
+                    return True
+        return False
 
     def stop_game(self) -> dict[str, Any]:
         """Stop the current game."""
@@ -545,6 +800,11 @@ async def handle_list_tools() -> list[types.Tool]:
         types.Tool(
             name="nethack_diff",
             description="Get the difference between current and previous screen",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="nethack_show_map",
+            description="Show a text representation of the current dungeon map",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
@@ -662,6 +922,17 @@ async def handle_call_tool(
             diff = state.get("diff", "No diff available")
             print(f"[AI CALL RESULT] {name}: {diff}", file=sys.stderr, flush=True)
             return [types.TextContent(type="text", text=f"```\n{diff}\n```")]
+
+        elif name == "nethack_show_map":
+            result = await asyncio.to_thread(client._show_map)
+            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
+            if result.get("status") == "success":
+                map_output = f"Map for Level {result['level']}\n"
+                map_output += f"Explored: {result['explored_tiles']} tiles | Seen: {result['seen_tiles']} tiles\n\n"
+                map_output += result['map']
+                return [types.TextContent(type="text", text=f"```\n{map_output}\n```")]
+            else:
+                return [types.TextContent(type="text", text=f"```\n{result['error']}\n```")]
 
         else:
             error_result = {"error": f"Unknown tool: {name}"}
