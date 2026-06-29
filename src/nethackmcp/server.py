@@ -712,13 +712,36 @@ class NetHackClient:
 
     def stop_game(self) -> dict[str, Any]:
         """Stop the current game."""
+        if self.session_name is None:
+            return {"status": "stopped", "message": "No game running"}
+        
         try:
-            if self.session_name:
-                subprocess.run(
-                    ["tmux", "kill-session", "-t", self.session_name],
-                    check=True,
-                    capture_output=True,
-                )
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self.session_name, ":quit"],
+                check=True,
+                capture_output=True,
+            )
+            time.sleep(1)
+            
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self.session_name, "#quit"],
+                check=True,
+                capture_output=True,
+            )
+            time.sleep(1)
+            
+            subprocess.run(
+                ["tmux", "send-keys", "-t", self.session_name, "Enter"],
+                check=True,
+                capture_output=True,
+            )
+            time.sleep(1)
+            
+            subprocess.run(
+                ["tmux", "kill-session", "-t", self.session_name],
+                check=True,
+                capture_output=True,
+            )
         except subprocess.CalledProcessError:
             pass
 
@@ -735,7 +758,7 @@ class NetHackClient:
         self.goal_locked_until_counter = -1
         self.game_state = {}
 
-        return {"status": "stopped"}
+        return {"status": "stopped", "message": "Game stopped successfully"}
 
 
 server = Server("nethack-mcp")
