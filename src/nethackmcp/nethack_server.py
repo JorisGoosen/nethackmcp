@@ -85,6 +85,11 @@ class NetHackServer:
             for char in command:
                 subprocess.run(['tmux', 'send-keys', '-t', self.session_name, char],
                               check=True, capture_output=True)
+            
+            # Extended commands (starting with #) need Enter to execute
+            if command.startswith("#"):
+                subprocess.run(['tmux', 'send-keys', '-t', self.session_name, 'Enter'],
+                              check=True, capture_output=True)
         
         time.sleep(0.5)
         return self.get_screen()

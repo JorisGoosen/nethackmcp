@@ -394,6 +394,14 @@ class NetHackClient:
                         check=True,
                         capture_output=True,
                     )
+                
+                # Extended commands (starting with #) need Enter to execute
+                if command.startswith("#"):
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", self.session_name, "Enter"],
+                        check=True,
+                        capture_output=True,
+                    )
 
             # Wait for NetHack to process
             time.sleep(0.5)
