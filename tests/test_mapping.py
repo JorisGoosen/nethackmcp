@@ -1280,14 +1280,13 @@ class TestMovementAnalyzer(unittest.TestCase):
                     prev_pos = (0, 3)
                     curr_pos = (1, 4)
                 
-                prev_screen = [
-                    "Level: 1",
-                    f"{' ' * prev_pos[1]}@{' ' * (40 - prev_pos[1] - 1)}",
-                ]
-                curr_screen = [
-                    "Level: 1",
-                    f"{' ' * curr_pos[1]}@{' ' * (40 - curr_pos[1] - 1)}",
-                ]
+                # Create 24-line screens with @ at the specified position
+                def make_screen(player_row, player_col):
+                    lines = ["Level: 1"] + [" " * 40] * player_row + [" " * player_col + "@" + " " * (40 - player_col - 1)] + [" " * 40] * (23 - player_row)
+                    return lines
+                
+                prev_screen = make_screen(prev_pos[0], prev_pos[1])
+                curr_screen = make_screen(curr_pos[0], curr_pos[1])
                 
                 analyzer.analyze(prev_screen, None)
                 result = analyzer.analyze(curr_screen, prev_screen)

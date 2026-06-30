@@ -115,7 +115,7 @@ class MovementAnalyzer:
         curr_player = self._find_player(current_lines)
         
         # If no previous screen, just record current state
-        if previous_lines is None or self._previous_player_pos is None:
+        if previous_lines is None:
             result["player_screen_pos"] = curr_player
             self._previous_player_pos = curr_player
             return result
