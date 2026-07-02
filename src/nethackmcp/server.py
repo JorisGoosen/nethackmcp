@@ -754,6 +754,21 @@ class NetHackClient:
                     os.remove(sf)
             except Exception:
                 pass
+        
+        # Clear NetHack's default save directory to prevent auto-restore
+        home = os.path.expanduser("~")
+        nethack_dirs = [
+            os.path.join(home, ".nethack"),  # Default location
+            os.path.join(home, ".local", "share", "nethack"),  # XDG base directory
+            "/var/lib/nethack",  # System-wide
+        ]
+        for nethack_dir in nethack_dirs:
+            try:
+                if os.path.isdir(nethack_dir):
+                    import shutil
+                    shutil.rmtree(nethack_dir)
+            except Exception:
+                pass
 
         self.session_name = None
         self.state_file = None
