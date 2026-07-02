@@ -59,8 +59,8 @@ The server maintains game state using tmux sessions. Each game gets its own tmux
 class NetHackClient:
     """Handles NetHack game using persistent tmux sessions.
     
-    NOTE: Each instance starts fresh - no automatic state restoration.
-    State is only persisted via state files during active gameplay.
+    State is persisted via state files across MCP invocations.
+    NetHack save files are cleared to ensure fresh game starts.
     """
 
     TMUX_SESSION_PREFIX = "nethack_"
