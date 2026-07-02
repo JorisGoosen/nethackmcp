@@ -78,32 +78,6 @@ class NetHackClient:
         # Previous screen state for diff
         self.previous_screen: str | None = None
         self.previous_stripped_screen: list[str] | None = None
-        
-        # Check for existing state from previous run
-        existing_state = self._find_existing_state()
-        if existing_state:
-            try:
-                with open(existing_state, "r") as f:
-                    state = json.load(f)
-                    self.session_name = state.get("session_name")
-                    self.state_file = existing_state
-                    self.current_goal = state.get("current_goal", "")
-                    self.goal_counter = state.get("goal_counter", 0)
-                    self.goal_locked_until_counter = state.get("goal_locked_until_counter", -1)
-                    
-                    # Restore maps
-                    maps_data = state.get("maps", {})
-                    for level_str, map_data in maps_data.items():
-                        level = int(level_str)
-                        self.maps[level] = DungeonMap.from_dict(map_data)
-                    
-                    self.current_level = state.get("current_level", 1)
-                    self.previous_screen = state.get("previous_screen")
-                    self.previous_stripped_screen = state.get("previous_stripped_screen", [])
-                    
-                    self.game_state = state
-            except Exception:
-                pass
 
     def _strip_ansi(self, text: str) -> tuple[str, str]:
         """Strip ANSI escape codes from text. Returns (stripped_text, colored_text)."""
@@ -150,6 +124,12 @@ class NetHackClient:
         if state_files:
             return state_files[0]
         return None
+    
+    def _find_all_state_files(self) -> list[str]:
+        """Find all state files from previous games."""
+        import glob
+
+        return glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
 
     def _get_session_name(self) -> str:
         """Get or create a tmux session name."""
@@ -284,9 +264,9 @@ class NetHackClient:
         session_name = self._get_session_name()
         state_file = self._get_state_file()
 
-        # Clean up any existing session
+        # Clean up any existing session and ALL state files to ensure fresh start
         self.stop_game()
-
+        
         # Create tmux session with NetHack running in a loop
         # NetHack exits when stdin closes, so we wrap it to keep it running
         cmd = [
@@ -762,11 +742,24 @@ class NetHackClient:
         except Exception:
             pass
 
+        # Clean up any existing state files from previous runs
+        state_files = self._find_all_state_files()
+        for sf in state_files:
+            try:
+                if os.path.exists(sf):
+                    os.remove(sf)
+            except Exception:
+                pass
+
         self.session_name = None
         self.state_file = None
         self.current_goal = "Explore"
         self.goal_counter = 0
         self.goal_locked_until_counter = -1
+        self.current_level = 1
+        self.maps = {}
+        self.previous_screen = None
+        self.previous_stripped_screen = None
         self.game_state = {}
 
         return {"status": "stopped", "message": "Game stopped successfully"}
