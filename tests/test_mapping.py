@@ -78,6 +78,8 @@ class TestDungeonMap(unittest.TestCase):
         self.assertEqual(map_obj.level, 1)
         self.assertEqual(len(map_obj.tiles), 0)
         self.assertIsNone(map_obj.player_world_pos)
+        # Initial bounds should be None (no tiles yet)
+        self.assertIsNone(map_obj.bounds["min_x"])
     
     def test_set_tile(self):
         """Test setting a tile."""
@@ -192,11 +194,11 @@ class TestDungeonMap(unittest.TestCase):
         """Test that bounds are tracked correctly."""
         map_obj = DungeonMap(level=1)
         
-        # Initial bounds
-        self.assertEqual(map_obj.bounds["min_x"], 0)
-        self.assertEqual(map_obj.bounds["max_x"], 0)
-        self.assertEqual(map_obj.bounds["min_y"], 0)
-        self.assertEqual(map_obj.bounds["max_y"], 0)
+        # Initial bounds should be None (no tiles yet)
+        self.assertIsNone(map_obj.bounds["min_x"])
+        self.assertIsNone(map_obj.bounds["max_x"])
+        self.assertIsNone(map_obj.bounds["min_y"])
+        self.assertIsNone(map_obj.bounds["max_y"])
         
         # Add tiles at different positions
         map_obj.set_tile(-5, 10, '#')
@@ -221,6 +223,9 @@ class TestDungeonMap(unittest.TestCase):
     def test_bounds_after_multiple_operations(self):
         """Test bounds after multiple set_tile operations."""
         map_obj = DungeonMap(level=1)
+        
+        # Initial bounds should be None
+        self.assertIsNone(map_obj.bounds["min_x"])
         
         map_obj.set_tile(0, 0, '#')
         map_obj.set_tile(1, 0, '.')
@@ -378,6 +383,11 @@ class TestDungeonMap(unittest.TestCase):
         self.assertIsNone(data["player_world_pos"])
         self.assertIsNone(data["player_screen_pos"])
         self.assertIsNone(data["screen_offset"])
+        # Bounds should be converted to 0,0,0,0 for serialization when empty
+        self.assertEqual(data["bounds"]["min_x"], 0)
+        self.assertEqual(data["bounds"]["max_x"], 0)
+        self.assertEqual(data["bounds"]["min_y"], 0)
+        self.assertEqual(data["bounds"]["max_y"], 0)
         
         map_obj2 = DungeonMap.from_dict(data)
         self.assertEqual(map_obj2.level, 1)

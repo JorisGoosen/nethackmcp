@@ -43,10 +43,10 @@ class DungeonMap:
         self.level = level
         self.tiles: dict[tuple[int, int], Tile] = {}
         self.bounds = {
-            "min_x": 0,
-            "max_x": 0,
-            "min_y": 0,
-            "max_y": 0,
+            "min_x": None,
+            "max_x": None,
+            "min_y": None,
+            "max_y": None,
         }
         self.player_world_pos: tuple[int, int] | None = None
         self.player_screen_pos: tuple[int, int] | None = None  # (row, col) on screen
@@ -65,10 +65,16 @@ class DungeonMap:
     
     def _update_bounds(self, x: int, y: int):
         """Update the map bounds to include the given coordinates."""
-        self.bounds["min_x"] = min(self.bounds["min_x"], x)
-        self.bounds["max_x"] = max(self.bounds["max_x"], x)
-        self.bounds["min_y"] = min(self.bounds["min_y"], y)
-        self.bounds["max_y"] = max(self.bounds["max_y"], y)
+        if self.bounds["min_x"] is None:
+            self.bounds["min_x"] = x
+            self.bounds["max_x"] = x
+            self.bounds["min_y"] = y
+            self.bounds["max_y"] = y
+        else:
+            self.bounds["min_x"] = min(self.bounds["min_x"], x)
+            self.bounds["max_x"] = max(self.bounds["max_x"], x)
+            self.bounds["min_y"] = min(self.bounds["min_y"], y)
+            self.bounds["max_y"] = max(self.bounds["max_y"], y)
     
     def get_tile(self, x: int, y: int) -> Tile | None:
         """Get tile at given world coordinates."""
@@ -96,10 +102,13 @@ class DungeonMap:
         if (x, y) in self.tiles:
             self.tiles[(x, y)].seen = True
     
-    def set_player_position(self, world_x: int, world_y: int):
+    def set_player_position(self, world_x: int, world_y: int, terrain: str = '.'):
         """Set player's world position and mark tile as visited."""
         self.player_world_pos = (world_x, world_y)
-        self.mark_visited(world_x, world_y)
+        if (world_x, world_y) not in self.tiles:
+            self.set_tile(world_x, world_y, terrain)
+        self.tiles[(world_x, world_y)].visited = True
+        self.tiles[(world_x, world_y)].seen = True
     
     def get_explored_count(self) -> int:
         """Count tiles that have been visited."""
@@ -118,12 +127,15 @@ class DungeonMap:
     
     def to_dict(self) -> dict[str, Any]:
         """Convert map to dictionary for serialization."""
+        bounds = self.bounds.copy()
+        if bounds["min_x"] is None:
+            bounds = {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0}
         return {
             "level": self.level,
             "player_world_pos": self.player_world_pos,
             "player_screen_pos": self.player_screen_pos,
             "screen_offset": self._screen_offset,
-            "bounds": self.bounds,
+            "bounds": bounds,
             "tiles": {
                 f"{x},{y}": tile.to_dict()
                 for (x, y), tile in self.tiles.items()

@@ -251,8 +251,17 @@ class NetHackClient:
                     new_x = current_map.player_world_pos[0] + player_delta[1]  # delta_col -> x
                     new_y = current_map.player_world_pos[1] + player_delta[0]  # delta_row -> y
                     current_map.set_player_position(new_x, new_y)
-                    result["player_world_pos"] = (new_x, new_y)
-                    result["map_updated"] = True
+                else:
+                    # No previous world position, calculate from current screen
+                    game_area_lines = screen_lines[game_start:game_end+1]
+                    screen_center_row = len(game_area_lines) // 2
+                    screen_center_col = max(len(line) for line in game_area_lines) // 2 if game_area_lines else 40
+                    relative_row = player_row - game_start
+                    new_x = player_col - screen_center_col
+                    new_y = relative_row - screen_center_row
+                    current_map.set_player_position(new_x, new_y)
+                result["player_world_pos"] = current_map.player_world_pos
+                result["map_updated"] = True
         
         # Extract terrain from screen (filter out status bars)
         # NetHack screen layout:
@@ -283,8 +292,20 @@ class NetHackClient:
         if player_row >= 0 and player_col >= 0:
             current_map.player_screen_pos = (player_row, player_col)
             
-            # Player starts at (0, 0) on each level
-            current_map.set_player_position(0, 0)
+            # Calculate world position from screen position
+            # Screen center is (0,0) in world coordinates
+            game_area_lines = screen_lines[game_start:game_end+1]
+            screen_center_row = len(game_area_lines) // 2
+            screen_center_col = max(len(line) for line in game_area_lines) // 2 if game_area_lines else 40
+            
+            # Player screen position relative to game area
+            relative_row = player_row - game_start
+            world_x = player_col - screen_center_col
+            world_y = relative_row - screen_center_row
+            
+            # Only update if position changed or not set
+            if current_map.player_world_pos != (world_x, world_y):
+                current_map.set_player_position(world_x, world_y)
         
         result["map_updated"] = result["map_updated"] or result["player_moved_world"]
         return result
@@ -670,10 +691,11 @@ class NetHackClient:
         current_map = self.maps[self.current_level]
         
         # Get bounds
-        min_x = current_map.bounds.get("min_x", 0)
-        max_x = current_map.bounds.get("max_x", 0)
-        min_y = current_map.bounds.get("min_y", 0)
-        max_y = current_map.bounds.get("max_y", 0)
+        bounds = current_map.bounds
+        min_x = bounds.get("min_x", 0) if bounds.get("min_x") is not None else 0
+        max_x = bounds.get("max_x", 0) if bounds.get("max_x") is not None else 0
+        min_y = bounds.get("min_y", 0) if bounds.get("min_y") is not None else 0
+        max_y = bounds.get("max_y", 0) if bounds.get("max_y") is not None else 0
         
         # Add some padding
         padding = 2
