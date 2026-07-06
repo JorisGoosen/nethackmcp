@@ -51,6 +51,7 @@ class DungeonMap:
         self.player_world_pos: tuple[int, int] | None = None
         self.player_screen_pos: tuple[int, int] | None = None  # (row, col) on screen
         self._screen_offset: tuple[int, int] | None = None  # (row_offset, col_offset)
+        self.downstairs_pos: tuple[int, int] | None = None  # World coordinates of downstairs
     
     @property
     def screen_offset(self) -> tuple[int, int]:
@@ -82,6 +83,8 @@ class DungeonMap:
     
     def set_tile(self, x: int, y: int, terrain: str, seen: bool = False):
         """Set tile at given coordinates."""
+        if terrain == '>':
+            self.downstairs_pos = (x, y)
         passable = terrain in self.PASSABLE_TERRAIN
         self.tiles[(x, y)] = Tile(
             terrain=terrain,
@@ -136,6 +139,7 @@ class DungeonMap:
             "player_screen_pos": self.player_screen_pos,
             "screen_offset": self._screen_offset,
             "bounds": bounds,
+            "downstairs_pos": self.downstairs_pos,
             "tiles": {
                 f"{x},{y}": tile.to_dict()
                 for (x, y), tile in self.tiles.items()
@@ -150,6 +154,7 @@ class DungeonMap:
         map_obj.player_screen_pos = tuple(data["player_screen_pos"]) if data["player_screen_pos"] else None
         map_obj._screen_offset = tuple(data["screen_offset"]) if data["screen_offset"] else None
         map_obj.bounds = data["bounds"]
+        map_obj.downstairs_pos = tuple(data["downstairs_pos"]) if data["downstairs_pos"] else None
         
         for (xy_str, tile_data) in data["tiles"].items():
             x, y = map(int, xy_str.split(","))
@@ -170,3 +175,42 @@ class DungeonMap:
         if tile:
             return tile.terrain
         return None
+    
+    def get_map_string(self) -> str:
+        """Generate a string representation of the map showing only seen terrain."""
+        bounds = self.bounds
+        min_x = bounds.get("min_x", 0) if bounds.get("min_x") is not None else 0
+        max_x = bounds.get("max_x", 0) if bounds.get("max_x") is not None else 0
+        min_y = bounds.get("min_y", 0) if bounds.get("min_y") is not None else 0
+        max_y = bounds.get("max_y", 0) if bounds.get("max_y") is not None else 0
+        
+        # Add padding around the seen area
+        padding = 2
+        min_x -= padding
+        max_x += padding
+        min_y -= padding
+        max_y += padding
+        
+        # Build map showing only seen tiles
+        map_lines = []
+        for y in range(max_y, min_y - 1, -1):  # Y goes from top (max) to bottom (min)
+            line = ""
+            for x in range(min_x, max_x + 1):
+                tile = self.get_tile(x, y)
+                if tile and tile.seen:
+                    # Show actual terrain, but replace @ and $ with ?
+                    terrain = tile.terrain
+                    if terrain in '@$':
+                        terrain = '?'
+                    elif terrain == ' ':  # cave wall in game -> X in map
+                        terrain = 'X'
+                    else:
+                        terrain = terrain
+                    line += terrain
+                elif tile:  # unseen but known tile - show ?
+                    line += '?'
+                else:
+                    line += " "  # completely unknown
+            map_lines.append(line)
+        
+        return "\n".join(map_lines)
