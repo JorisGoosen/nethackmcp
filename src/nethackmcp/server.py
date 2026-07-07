@@ -108,8 +108,6 @@ class NetHackClient:
                     self.previous_screen = state.get("previous_screen")
                     self.previous_stripped_screen = state.get("previous_stripped_screen", [])
                     self._player_chunks_4x4 = state.get("player_chunks_4x4")
-                    self._player_world_x = state.get("player_world_x", 0)
-                    self._player_world_y = state.get("player_world_y", 0)
                     
                     self.game_state = state
             except Exception:
@@ -284,21 +282,18 @@ class NetHackClient:
         
         if self._player_chunks_4x4 is None:
             # First frame - initialize
-            self._player_world_x = 0
-            self._player_world_y = 0
+            current_map.set_player_position(0, 0, '.')
             self._player_chunks_4x4 = current_chunk
             
             # Get actual terrain at player position
-            player_terrain = '.'
             if player_row >= 0 and player_row < len(screen_lines):
                 row = screen_lines[player_row]
                 if player_col >= 0 and player_col < len(row):
-                    player_terrain = row[player_col]
+                    terrain = row[player_col]
+                    if terrain != '@':
+                        current_map.set_tile(0, 0, terrain)
             
-            current_map.set_player_position(0, 0, player_terrain)
-            result["player_world_pos"] = [self._player_world_x, self._player_world_y]
-            import sys
-            print(f"DEBUG: First frame, player at ({self._player_world_x}, {self._player_world_y})", file=sys.stderr)
+            result["player_world_pos"] = list(current_map.player_world_pos) if current_map.player_world_pos else [0, 0]
         else:
             # Try to find the chunk in previous frame with different offsets
             offsets_to_check = [
@@ -318,8 +313,11 @@ class NetHackClient:
             if best_match and best_match != (0, 0):
                 # Player moved! Update world position
                 dy, dx = best_match
-                self._player_world_y += dy
-                self._player_world_x += dx
+                if current_map.player_world_pos:
+                    current_map.player_world_pos = (
+                        current_map.player_world_pos[0] + dx,
+                        current_map.player_world_pos[1] + dy
+                    )
                 result["player_moved_world"] = True
                 result["screen_shifted"] = True
                 result["map_updated"] = True
@@ -331,16 +329,18 @@ class NetHackClient:
                     if player_col >= 0 and player_col < len(row):
                         new_player_terrain = row[player_col]
                 
-                current_map.set_player_position(self._player_world_x, self._player_world_y, new_player_terrain)
-                result["player_world_pos"] = [self._player_world_x, self._player_world_y]
-                
-                import sys
-                print(f"DEBUG: Player moved by ({dy}, {dx}), now at ({self._player_world_x}, {self._player_world_y})", file=sys.stderr)
+                if current_map.player_world_pos:
+                    current_map.set_player_position(
+                        current_map.player_world_pos[0],
+                        current_map.player_world_pos[1],
+                        new_player_terrain
+                    )
+                result["player_world_pos"] = list(current_map.player_world_pos) if current_map.player_world_pos else [0, 0]
             
             self._player_chunks_4x4 = current_chunk
         
-        player_world_x = self._player_world_x
-        player_world_y = self._player_world_y
+        player_world_pos = current_map.player_world_pos or (0, 0)
+        player_world_x, player_world_y = player_world_pos
         
         for row in range(game_start, game_end + 1):
             if row < len(screen_lines):
@@ -713,8 +713,9 @@ class NetHackClient:
                     state["goal_locked_until_counter"] = self.goal_locked_until_counter
                     state["maps"] = maps_data
                     state["current_level"] = self.current_level
-                    state["player_world_x"] = self._player_world_x
-                    state["player_world_y"] = self._player_world_y
+                    current_map = self.maps.get(self.current_level)
+                    if current_map and current_map.player_world_pos:
+                        state["player_world_pos"] = list(current_map.player_world_pos)
                     state["previous_screen"] = self.previous_screen
                     state["previous_stripped_screen"] = self.previous_stripped_screen
                     state["player_chunks_4x4"] = self._player_chunks_4x4
@@ -852,8 +853,6 @@ class NetHackClient:
         self.goal_locked_until_counter = -1
         self.current_level = 1
         self.maps = {}
-        self._player_world_x = 0
-        self._player_world_y = 0
         self._player_chunks_4x4 = None
         self.previous_screen = None
         self.previous_stripped_screen = None
