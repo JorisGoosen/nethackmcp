@@ -221,7 +221,7 @@ class DungeonMap:
                     screen_row_offset = row - player_row
                     screen_col_offset = col - player_col
                     world_y = 0 - screen_row_offset
-                    world_x = 0 - screen_col_offset
+                    world_x = screen_col_offset
                     
                     tiles_with_terrain.add((world_x, world_y))
                     map_obj.set_tile(world_x, world_y, char, seen=True)
