@@ -350,7 +350,7 @@ class NetHackClient:
                         screen_row_offset = row - player_row
                         screen_col_offset = col - player_col
                         world_y = player_world_y - screen_row_offset
-                        world_x = player_world_x - screen_col_offset
+                        world_x = player_world_x + screen_col_offset
                         current_map.set_tile(world_x, world_y, char, seen=True)
         
         current_map.mark_visited(player_world_x, player_world_y)
