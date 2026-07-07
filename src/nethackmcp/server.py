@@ -20,7 +20,6 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
 from nethackmcp.map import DungeonMap, Tile
-from nethackmcp.movement_analyzer import MovementAnalyzer
 
 SERVER_INSTRUCTIONS = """\
 You are connected to NetHack through this MCP server.
@@ -77,7 +76,6 @@ class NetHackClient:
         # Mapping system
         self.maps: dict[int, DungeonMap] = {}
         self.current_level: int = 1
-        self.movement_analyzer = MovementAnalyzer()
         
         # Previous screen state for diff
         self.previous_screen: str | None = None
