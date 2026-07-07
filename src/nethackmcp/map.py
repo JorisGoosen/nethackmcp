@@ -168,8 +168,10 @@ class DungeonMap:
         screen_center_row = len(screen_lines) // 2
         screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
         
-        world_x = screen_col - screen_center_col
-        world_y = screen_row - screen_center_row
+        screen_row_offset = screen_row - screen_center_row
+        screen_col_offset = screen_col - screen_center_col
+        world_y = -screen_row_offset
+        world_x = screen_col_offset
         
         tile = self.get_tile(world_x, world_y)
         if tile:
