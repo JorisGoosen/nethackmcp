@@ -96,14 +96,24 @@ class DungeonMap:
     
     def mark_visited(self, x: int, y: int):
         """Mark tile as visited (player has stood here)."""
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise ValueError(f"Coordinates must be integers, got ({type(x).__name__}, {type(y).__name__})")
+        
         if (x, y) in self.tiles:
             self.tiles[(x, y)].visited = True
             self.tiles[(x, y)].seen = True
+        else:
+            self.tiles[(x, y)] = Tile(terrain='.', visited=True, seen=True, passable=True)
     
     def mark_seen(self, x: int, y: int):
         """Mark tile as seen (currently visible on screen)."""
+        if not isinstance(x, int) or not isinstance(y, int):
+            raise ValueError(f"Coordinates must be integers, got ({type(x).__name__}, {type(y).__name__})")
+        
         if (x, y) in self.tiles:
             self.tiles[(x, y)].seen = True
+        else:
+            self.tiles[(x, y)] = Tile(terrain='.', visited=False, seen=True, passable=True)
     
     def set_player_position(self, world_x: int, world_y: int, terrain: str = '.'):
         """Set player's world position and mark tile as visited."""
