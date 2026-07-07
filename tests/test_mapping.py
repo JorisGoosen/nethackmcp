@@ -3,9 +3,9 @@
 import json
 import unittest
 
-from src.nethackmcp.map import DungeonMap, Tile
-from src.nethackmcp.movement_analyzer import MovementAnalyzer
-from src.nethackmcp.server import NetHackClient
+from nethackmcp.map import DungeonMap, Tile
+from nethackmcp.movement_analyzer import MovementAnalyzer
+from nethackmcp.server import NetHackClient
 
 
 class TestTile(unittest.TestCase):
@@ -526,7 +526,8 @@ class TestShowMap(unittest.TestCase):
         self.client.maps[1].set_tile(1, -1, '<')  # impassable (stairs up)
         
         self.client.maps[1].mark_visited(0, 0)
-        self.client.maps[1].mark_visited(-1, 1)  # Mark another tile as visited for '.' test
+        self.client.maps[1].mark_visited(-1, 1)
+        self.client.maps[1].mark_visited(0, 1)  # Mark tile with . terrain as visited
         self.client.maps[1].player_world_pos = (0, 0)
     
     def test_show_map_passable_unvisited_as_dot(self):
@@ -543,11 +544,11 @@ class TestShowMap(unittest.TestCase):
         # Should contain '?' for unvisited tile (unknown terrain)
         self.assertIn('?', result.get("map", ""))
     
-    def test_show_map_impassable_unvisited_as_X(self):
-        """Test that impassable unvisited tiles are shown as 'X'."""
+    def test_show_map_impassable_visited_as_wall(self):
+        """Test that visited impassable tiles show as their terrain character."""
         map_obj = DungeonMap(level=1)
-        map_obj.set_tile(1, 0, '|')
-        map_obj.mark_visited(1, 0)  # Mark as visited so we can test X for impassable
+        map_obj.set_tile(1, 0, '|')  # wall
+        map_obj.mark_visited(1, 0)
         map_obj.player_world_pos = (0, 0)
         
         client = NetHackClient()
@@ -555,7 +556,22 @@ class TestShowMap(unittest.TestCase):
         client.maps[1] = map_obj
         
         result = client._show_map()
-        # Should contain 'X' for visited impassable tile
+        # Walls should show as '|' not 'X' (X is only for rockwall/space)
+        self.assertIn('|', result.get("map", ""))
+    
+    def test_show_map_rockwall_visited_as_X(self):
+        """Test that rockwall (space) shows as 'X' when visited."""
+        map_obj = DungeonMap(level=1)
+        map_obj.set_tile(1, 0, ' ')  # rockwall (space)
+        map_obj.mark_visited(1, 0)
+        map_obj.player_world_pos = (0, 0)
+        
+        client = NetHackClient()
+        client.current_level = 1
+        client.maps[1] = map_obj
+        
+        result = client._show_map()
+        # Rockwall (space) should show as 'X'
         self.assertIn('X', result.get("map", ""))
     
     def test_show_map_visited_terrain_character(self):
@@ -647,19 +663,19 @@ class TestShowMap(unittest.TestCase):
         result = self.client._show_map()
         map_str = result.get("map", "")
         
-        # Map should contain: @ (player), . (visited passable), ? (unknown)
-        self.assertIn('@', map_str)  # player position
-        self.assertIn('.', map_str)  # visited passable
-        self.assertIn('?', map_str)  # unknown terrain
-        # Note: impassable unvisited tiles show as 'X', but in this setup they're all '?' except if visited
-        # Test with a dedicated setup to verify X
+        # Map should contain: player position (showing underlying terrain like #/.), 
+        # . (visited passable), ? (unknown/unvisited), X (visited rockwall)
+        self.assertIn('.', map_str)  # visited passable (floor)
+        self.assertIn('?', map_str)  # unknown/unvisited terrain
+        # The player position shows the underlying terrain (e.g., # or .), not @
+        # @ is only on the screen, not in the map
     
     def test_show_map_explored_count(self):
         """Test explored tile count in map output."""
         result = self.client._show_map()
         
-        # Two tiles are visited: (0,0) and (-1,1)
-        self.assertEqual(result.get("explored_tiles"), 2)
+        # Three tiles are visited: (0,0) and (-1,1)
+        self.assertEqual(result.get("explored_tiles"), 3)
     
     def test_show_map_seen_count(self):
         """Test seen tile count in map output."""
