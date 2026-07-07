@@ -675,7 +675,7 @@ class NetHackClient:
                         screen_col_offset = direction_col - player_col
                         # Convert to world coordinates
                         world_y = player_world_y - screen_row_offset
-                        world_x = player_world_x - screen_col_offset
+                        world_x = player_world_x + screen_col_offset
                         tile_obj = current_map.get_tile(world_x, world_y)
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
