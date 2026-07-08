@@ -353,6 +353,17 @@ class NetHackClient:
         
         current_map.mark_visited(player_world_x, player_world_y)
         
+        # Mark adjacent spaces as visited (so they show as X in map)
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                adj_world_y = player_world_y - dr
+                adj_world_x = player_world_x + dc
+                tile = current_map.get_tile(adj_world_x, adj_world_y)
+                if tile and tile.terrain == ' ':
+                    current_map.mark_visited(adj_world_x, adj_world_y)
+        
         result["map_updated"] = result["map_updated"] or result["player_moved_world"]
         return result
 

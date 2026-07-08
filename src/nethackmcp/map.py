@@ -202,18 +202,17 @@ class DungeonMap:
         """
         map_obj = cls(level=1)
         
-        # Find player position in game area
+        # Find player position anywhere on screen (not limited to game_start/game_end)
         player_pos = None
-        for row in range(game_start, game_end + 1):
-            if row < len(screen_lines):
-                col = screen_lines[row].find('@')
-                if col >= 0:
-                    player_pos = (row, col)
-                    break
+        for row in range(len(screen_lines)):
+            col = screen_lines[row].find('@')
+            if col >= 0:
+                player_pos = (row, col)
+                break
         
-        # If no player found, try to find at center
+        # If no player found, raise an error (player must be visible)
         if player_pos is None:
-            player_pos = ((game_start + game_end) // 2, 40)
+            raise ValueError("No player position (@) found on screen")
         
         player_row, player_col = player_pos
         
@@ -224,10 +223,8 @@ class DungeonMap:
         # WHITELIST of terrain characters to include in map (geometry only)
         TERRAIN_WHITELIST = {'#', '.', '+', '-', '|', '<', '>'}
         
-        # First pass: collect all visible TERRAIN from screen (geometry only)
-        for row in range(game_start, game_end + 1):
-            if row >= len(screen_lines):
-                continue
+        # First pass: collect all visible TERRAIN from screen
+        for row in range(len(screen_lines)):
             line = screen_lines[row]
             for col, char in enumerate(line):
                 if char == '@':
@@ -299,15 +296,14 @@ class DungeonMap:
             for x in range(min_x, max_x + 1):
                 tile = self.get_tile(x, y)
                 if tile and (tile.visited or tile.seen):
-                    # Show actual terrain, but replace @, $, and player position with ?
+                    # Show actual terrain
                     terrain = tile.terrain
-                    if terrain in '@$':
-                        terrain = '?'
-                    elif (x, y) == self.player_world_pos:
-                        terrain = '?'
-                    elif terrain == ' ':  # cave wall in game -> X in map
+                    # Only show X for visited rockwalls (spaces)
+                    if terrain == ' ' and tile.visited:
                         terrain = 'X'
-                    else:
+                    elif terrain == ' ' and not tile.visited:
+                        terrain = ' '
+                    elif (x, y) == self.player_world_pos:
                         terrain = terrain
                     line += terrain
                 else:
