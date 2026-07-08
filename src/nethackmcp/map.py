@@ -217,76 +217,69 @@ class DungeonMap:
         
         player_row, player_col = player_pos
         
-        # First, collect all visible tiles from screen
-        # We need to track which coordinates have terrain to handle empty spaces
-        tiles_with_terrain = set()
+        # Player is at world position (0, 0)
+        # Calculate the world bounds of what we can see from the screen
+        # Screen center is player position in world coordinates
+        world_player_y = 0
+        world_player_x = 0
         
+        # First pass: collect all visible tiles from screen
         for row in range(game_start, game_end + 1):
             if row >= len(screen_lines):
                 continue
             line = screen_lines[row]
             for col, char in enumerate(line):
-                # Include all visible characters (not just passable/impassable)
-                # But skip player position (@) and empty space
+                # Skip player position (@) and empty space
                 if char != ' ' and char != '@':
                     # Calculate world coordinates
-                    screen_row_offset = row - player_row
-                    screen_col_offset = col - player_col
-                    world_y = 0 - screen_row_offset
-                    world_x = screen_col_offset
+                    # row = player_row - world_y (since y increases upward)
+                    # col = player_col + world_x
+                    world_y = player_row - row
+                    world_x = col - player_col
                     
-                    tiles_with_terrain.add((world_x, world_y))
                     map_obj.set_tile(world_x, world_y, char, seen=True)
         
+        # Set player position
+        map_obj.player_world_pos = (world_player_x, world_player_y)
+        
+        # Mark player position tile
+        if (world_player_x, world_player_y) not in map_obj.tiles:
+            map_obj.set_tile(world_player_x, world_player_y, '.')
+        
         # Mark player position as visited
-        map_obj.player_world_pos = (0, 0)
-        if (0, 0) in map_obj.tiles:
-            map_obj.mark_visited(0, 0)
+        map_obj.mark_visited(world_player_x, world_player_y)
+        
+        # Determine if we're in a room or cave based on visible terrain
+        # In rooms: walls surround us, floor is visible
+        # In caves: we see empty space (' ') adjacent to visited terrain
+        has_empty_space = any(t.terrain == ' ' for t in map_obj.tiles.values())
+        
+        if has_empty_space:
+            # Cave mode: mark empty spaces adjacent to visited as SEEN (for ? rendering)
+            # But don't mark them as visited
+            visited_tiles = [(x, y) for (x, y), t in map_obj.tiles.items() if t.visited]
+            
+            for (vx, vy) in visited_tiles:
+                for dx in [-1, 0, 1]:
+                    for dy in [-1, 0, 1]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        tx, ty = vx + dx, vy + dy
+                        if (tx, ty) not in map_obj.tiles:
+                            # Calculate screen position
+                            screen_row = player_row - ty
+                            screen_col = tx + player_col
+                            
+                            if 0 <= screen_row < len(screen_lines):
+                                line = screen_lines[screen_row]
+                                if screen_col < len(line) and line[screen_col] == ' ':
+                                    map_obj.set_tile(tx, ty, ' ', seen=True)
         else:
-            # Place player on floor if no tile exists
-            map_obj.set_tile(0, 0, '.')
-            map_obj.mark_visited(0, 0)
-        
-        # Mark tiles adjacent to player as visited (for adjacency logic)
-        adjacent_tiles = set()
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue
-                adj_x, adj_y = dx, dy
-                adjacent_tiles.add((adj_x, adj_y))
-        
-        # Mark ALL tiles that are on screen as visited (they're "seen" and part of visible dungeon)
-        # But keep gold ($) as unvisited so it shows as ? in output
-        for (x, y), tile in map_obj.tiles.items():
-            if tile.terrain != '$':
-                map_obj.mark_visited(x, y)
-        
-        # Now fill in empty spaces adjacent to passable tiles as seen (so they show ?)
-        # Find all tiles that are adjacent to visited tiles but don't have terrain
-        visited_tiles = [(x, y) for (x, y), t in map_obj.tiles.items() if t.visited]
-        
-        for (vx, vy) in visited_tiles:
-            for dx in [-1, 0, 1]:
-                for dy in [-1, 0, 1]:
-                    if dx == 0 and dy == 0:
-                        continue
-                    tx, ty = vx + dx, vy + dy
-                    if (tx, ty) not in map_obj.tiles:
-                        # Empty space adjacent to visited tile
-                        # Check if it's actually in the screen as empty space
-                        # Calculate screen position
-                        screen_row_offset = vy  # Since player_y = 0
-                        screen_col_offset = vx
-                        screen_row = player_row - screen_row_offset
-                        screen_col = player_col - screen_col_offset
-                        
-                        # Check if this screen position has empty space
-                        if 0 <= screen_row < len(screen_lines):
-                            line = screen_lines[screen_row]
-                            if screen_col < len(line) and line[screen_col] == ' ':
-                                # Empty space - add with seen=True so it shows ?
-                                map_obj.set_tile(tx, ty, ' ', seen=True)
+            # Room mode: all visible tiles are part of the room structure
+            # Mark all passable tiles as visited (room floor)
+            for (x, y), tile in map_obj.tiles.items():
+                if tile.passable and not tile.visited:
+                    map_obj.mark_visited(x, y)
         
         return map_obj
     
@@ -305,13 +298,22 @@ class DungeonMap:
         min_y -= padding
         max_y += padding
         
-         # Build map showing only seen tiles
+        # Find all visited tiles to determine the explored region
+        visited_tiles = [(x, y) for (x, y), t in self.tiles.items() if t.visited]
+        if visited_tiles:
+            min_x = min(min_x, min(x for x, y in visited_tiles) - padding)
+            max_x = max(max_x, max(x for x, y in visited_tiles) + padding)
+            min_y = min(min_y, min(y for x, y in visited_tiles) - padding)
+            max_y = max(max_y, max(y for x, y in visited_tiles) + padding)
+        
+        # Build map showing all seen tiles with actual terrain
+        # Only show ? for tiles that are neither seen nor visited (completely unknown)
         map_lines = []
         for y in range(max_y, min_y - 1, -1):  # Y goes from top (max) to bottom (min)
             line = ""
             for x in range(min_x, max_x + 1):
                 tile = self.get_tile(x, y)
-                if tile and tile.visited:
+                if tile and (tile.visited or tile.seen):
                     # Show actual terrain, but replace @, $, and player position with ?
                     terrain = tile.terrain
                     if terrain in '@$':
@@ -323,10 +325,8 @@ class DungeonMap:
                     else:
                         terrain = terrain
                     line += terrain
-                elif tile:  # unseen but known tile - show ?
-                    line += '?'
                 else:
-                    line += " "  # completely unknown
+                    line += '?'  # completely unknown - show ?
             map_lines.append(line)
         
         return "\n".join(map_lines)
