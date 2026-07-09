@@ -340,6 +340,9 @@ class DungeonMap:
             min_col = min(min_col, min(c for r, c in visited_tiles) - padding)
             max_col = max(max_col, max(c for r, c in visited_tiles) + padding)
         
+        # Calculate the width of each line (max columns range)
+        num_cols = max_col - min_col + 1
+        
         # Build map showing all seen tiles with actual terrain
         # Show ? only for empty tiles (' ') that are adjacent to passable terrain
         map_lines = []
@@ -348,7 +351,7 @@ class DungeonMap:
             for col in range(min_col, max_col + 1):
                 tile = self.get_tile(row, col)
                 
-                # Determine terrain to display
+                # Determine terrain to display (always exactly 1 character)
                 if tile and (tile.visited or tile.seen):
                     terrain = tile.terrain
                     if terrain == ' ' and tile.visited:
@@ -356,6 +359,10 @@ class DungeonMap:
                 elif tile:
                     terrain = tile.terrain
                 else:
+                    terrain = ' '
+                
+                # Ensure terrain is exactly 1 character, default to ' ' if not
+                if terrain is None or len(terrain) != 1:
                     terrain = ' '
                 
                 # If terrain is ' ' (empty), check if adjacent to passable terrain
