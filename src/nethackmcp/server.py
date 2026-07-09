@@ -83,6 +83,8 @@ class NetHackClient:
         
         # Terrain chunk tracking for movement detection
         self._player_chunks_4x4: list[list[str]] | None = None  # 4x4 terrain chunk from previous frame
+        self._previous_player_screen_pos: tuple[int, int] | None = None  # Player screen pos from previous frame
+        self._previous_player_world_pos: tuple[int, int] | None = None  # Player world pos from previous frame
         
         # Restore state from existing state file (but NOT NetHack save files)
         existing_state = self._find_existing_state()
@@ -106,6 +108,10 @@ class NetHackClient:
                     self.previous_screen = state.get("previous_screen")
                     self.previous_stripped_screen = state.get("previous_stripped_screen", [])
                     self._player_chunks_4x4 = state.get("player_chunks_4x4")
+                    if "previous_player_screen_pos" in state:
+                        self._previous_player_screen_pos = tuple(state["previous_player_screen_pos"])
+                    if "previous_player_world_pos" in state:
+                        self._previous_player_world_pos = tuple(state["previous_player_world_pos"])
                     
                     self.game_state = state
             except Exception:
@@ -216,31 +222,44 @@ class NetHackClient:
             return True
         return False
     
-    def _get_terrain_chunk(self, screen_lines: list[str], player_row: int, player_col: int, size: int = 4) -> list[list[str]]:
-        """Extract a chunk of terrain around the player for matching."""
+    def _get_terrain_chunk(self, screen_lines: list[str], screen_row: int, screen_col: int, size: int = 4) -> list[list[str]]:
+        """Extract a chunk of terrain from screen space (static terrain only).
+        
+        This extracts a 4x4 chunk at absolute screen position (screen_row, screen_col).
+        The chunk contains only static terrain characters (|, -, +, ., #, <, >).
+        Empty/unknown positions are filled with space ' '.
+        """
         chunk = []
         half = size // 2
         for dr in range(-half, half):
-            row = player_row + dr
+            row = screen_row + dr
             if 0 <= row < len(screen_lines):
                 line = screen_lines[row]
                 row_chunk = []
                 for dc in range(-half, half):
-                    col = player_col + dc
+                    col = screen_col + dc
                     if 0 <= col < len(line):
-                        row_chunk.append(line[col])
+                        char = line[col]
+                        # Only include static terrain (not player @, creatures, or items)
+                        if char in {'|', '-', '+', '.', '#', '<', '>'}:
+                            row_chunk.append(char)
+                        else:
+                            row_chunk.append(' ')  # Empty/unknown for non-terrain
                     else:
-                        row_chunk.append(" ")
-                chunk.append(row_chunk)
+                        row_chunk.append(' ')
+            else:
+                # Out of bounds - use empty chunk
+                row_chunk = [' '] * size
+            chunk.append(row_chunk)
         return chunk
     
     def _find_best_chunk_match(self, current_chunk: list[list[str]], prev_chunks_with_offsets: list[tuple[int, int, list[list[str]]]]) -> tuple[int, int] | None:
-        """Find which previous chunk position matches current chunk best. Returns (dy, dx) shift."""
+        """Find which previous chunk position matches current chunk best. Returns (screen_row, screen_col) of best match."""
         best_match = None
         best_score = -1
         size = len(current_chunk)
         
-        for dy, dx, prev_chunk in prev_chunks_with_offsets:
+        for screen_row, screen_col, prev_chunk in prev_chunks_with_offsets:
             if len(prev_chunk) != size or len(prev_chunk[0]) != size:
                 continue
             
@@ -252,7 +271,7 @@ class NetHackClient:
             
             if score > best_score:
                 best_score = score
-                best_match = (dy, dx)
+                best_match = (screen_row, screen_col)
         
         return best_match
     
@@ -271,99 +290,140 @@ class NetHackClient:
         
         current_map = self.maps[self.current_level]
         
+        # Calculate screen center (world origin)
+        screen_center_row = len(screen_lines) // 2
+        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
+        
+        # Player position in world coordinates (screen center is origin)
+        player_world_row = player_row - screen_center_row
+        player_world_col = player_col - screen_center_col
+        
         # Extract terrain from screen (filter out status bars)
         game_start = 6
         game_end = 15
         
-        # Get 4x4 terrain chunk around player
-        current_chunk = self._get_terrain_chunk(screen_lines, player_row, player_col, size=4)
+        # Store current player screen position for next comparison
+        current_player_screen_pos = (player_row, player_col)
         
         if self._player_chunks_4x4 is None:
             # First frame - initialize
-            current_map.set_player_position(0, 0, '.')
-            self._player_chunks_4x4 = current_chunk
+            current_map.set_player_position(player_world_row, player_world_col, '.')
+            self._player_chunks_4x4 = current_player_screen_pos
+            self._previous_player_world_pos = (player_world_row, player_world_col)
             
-            # Get actual terrain at player position
+            # Store actual terrain at player position
             if player_row >= 0 and player_row < len(screen_lines):
-                row = screen_lines[player_row]
-                if player_col >= 0 and player_col < len(row):
-                    terrain = row[player_col]
+                line = screen_lines[player_row]
+                if player_col >= 0 and player_col < len(line):
+                    terrain = line[player_col]
                     if terrain != '@':
-                        current_map.set_tile(0, 0, terrain)
+                        current_map.set_tile(player_world_row, player_world_col, terrain)
             
-            result["player_world_pos"] = list(current_map.player_world_pos) if current_map.player_world_pos else [0, 0]
+            result["player_world_pos"] = [player_world_row, player_world_col]
         else:
-            # Try to find the chunk in previous frame with different offsets
+            # Extract 4x4 terrain chunks from multiple positions to detect movement
             offsets_to_check = [
-                (0, 0), (-1, 0), (1, 0), (0, -1), (0, 1),
-                (-1, -1), (-1, 1), (1, -1), (1, 1)
+                (0, 0), (-2, 0), (2, 0), (0, -2), (0, 2),
+                (-2, -2), (-2, 2), (2, -2), (2, 2)
             ]
             
-            prev_chunks_with_offsets = [(dy, dx, self._get_terrain_chunk(
-                self.previous_stripped_screen or [], 
-                player_row + dy, 
-                player_col + dx, 
-                size=4
-            )) for dy, dx in offsets_to_check]
+            # Build map of previous chunks by their screen position
+            prev_chunks_by_pos = {}
+            for prev_row_offset, prev_col_offset in offsets_to_check:
+                prev_row = player_row + prev_row_offset
+                prev_col = player_col + prev_col_offset
+                chunk = self._get_terrain_chunk(
+                    self.previous_stripped_screen or [], 
+                    prev_row, 
+                    prev_col, 
+                    size=4
+                )
+                prev_chunks_by_pos[(prev_row, prev_col)] = chunk
             
-            best_match = self._find_best_chunk_match(current_chunk, prev_chunks_with_offsets)
+            # Try to find matching chunk at current position
+            best_match_pos = None
+            best_score = -1
             
-            if best_match and best_match != (0, 0):
-                # Player moved! Update world position
-                dy, dx = best_match
+            current_chunk = self._get_terrain_chunk(screen_lines, player_row, player_col, size=4)
+            
+            for (prev_row, prev_col), prev_chunk in prev_chunks_by_pos.items():
+                if len(prev_chunk) != 4 or len(prev_chunk[0]) != 4:
+                    continue
+                
+                score = 0
+                for r in range(4):
+                    for c in range(4):
+                        if prev_chunk[r][c] == current_chunk[r][c] and prev_chunk[r][c] not in ' @':
+                            score += 1
+                
+                if score > best_score:
+                    best_score = score
+                    best_match_pos = (prev_row, prev_col)
+            
+            # Check for screen shift vs player movement
+            if best_match_pos and best_match_pos != (player_row, player_col):
+                # Screen has shifted - terrain moved relative to screen
+                # Calculate the shift: how much did the screen move?
+                screen_shift_row = player_row - best_match_pos[0]
+                screen_shift_col = player_col - best_match_pos[1]
+                
+                # Update player world position based on screen shift
                 if current_map.player_world_pos:
                     current_map.player_world_pos = (
-                        current_map.player_world_pos[0] + dx,
-                        current_map.player_world_pos[1] + dy
+                        current_map.player_world_pos[0] + screen_shift_row,
+                        current_map.player_world_pos[1] + screen_shift_col
                     )
-                result["player_moved_world"] = True
                 result["screen_shifted"] = True
+                result["player_moved_world"] = True
                 result["map_updated"] = True
                 
-                # Get actual terrain at new player position
-                new_player_terrain = '.'
-                if player_row >= 0 and player_row < len(screen_lines):
-                    row = screen_lines[player_row]
-                    if player_col >= 0 and player_col < len(row):
-                        new_player_terrain = row[player_col]
-                
-                if current_map.player_world_pos:
-                    current_map.set_player_position(
-                        current_map.player_world_pos[0],
-                        current_map.player_world_pos[1],
-                        new_player_terrain
-                    )
-                result["player_world_pos"] = list(current_map.player_world_pos) if current_map.player_world_pos else [0, 0]
+                # Update player world position
+                current_map.set_player_position(player_world_row, player_world_col, '.')
+            else:
+                # Screen hasn't shifted significantly, check if player moved
+                # by comparing player screen position with previous frame
+                if hasattr(self, '_previous_player_screen_pos'):
+                    prev_row, prev_col = self._previous_player_screen_pos
+                    screen_row_delta = player_row - prev_row
+                    screen_col_delta = player_col - prev_col
+                    
+                    if screen_row_delta != 0 or screen_col_delta != 0:
+                        # Player moved relative to screen
+                        current_map.set_player_position(player_world_row, player_world_col, '.')
+                        result["player_moved_world"] = True
+                        result["map_updated"] = True
             
-            self._player_chunks_4x4 = current_chunk
+            # Update stored positions for next iteration
+            self._player_chunks_4x4 = current_player_screen_pos
+            self._previous_player_screen_pos = current_player_screen_pos
         
-        player_world_pos = current_map.player_world_pos or (0, 0)
-        player_world_x, player_world_y = player_world_pos
+        player_world_row, player_world_col = current_map.player_world_pos or (0, 0)
         
-        for row in range(game_start, game_end + 1):
-            if row < len(screen_lines):
-                line = screen_lines[row]
-                for col, char in enumerate(line):
-                    if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
-                        screen_row_offset = row - player_row
-                        screen_col_offset = col - player_col
-                        world_y = player_world_y - screen_row_offset
-                        world_x = player_world_x + screen_col_offset
-                        current_map.set_tile(world_x, world_y, char, seen=True)
+        # Update map with terrain from current screen
+        for row in range(game_start, min(game_end + 1, len(screen_lines))):
+            line = screen_lines[row]
+            for col, char in enumerate(line):
+                if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
+                    # Convert screen coords to world coords
+                    # Screen center is world origin (0, 0)
+                    world_row = row - screen_center_row
+                    world_col = col - screen_center_col
+                    current_map.set_tile(world_row, world_col, char, seen=True)
         
-        current_map.mark_visited(player_world_x, player_world_y)
+        current_map.mark_visited(player_world_row, player_world_col)
         
         # Mark adjacent spaces as visited (so they show as X in map)
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
                 if dr == 0 and dc == 0:
                     continue
-                adj_world_y = player_world_y - dr
-                adj_world_x = player_world_x + dc
-                tile = current_map.get_tile(adj_world_x, adj_world_y)
+                adj_world_row = player_world_row + dr
+                adj_world_col = player_world_col + dc
+                tile = current_map.get_tile(adj_world_row, adj_world_col)
                 if tile and tile.terrain == ' ':
-                    current_map.mark_visited(adj_world_x, adj_world_y)
+                    current_map.mark_visited(adj_world_row, adj_world_col)
         
+        result["player_world_pos"] = [player_world_row, player_world_col] if current_map.player_world_pos else [0, 0]
         result["map_updated"] = result["map_updated"] or result["player_moved_world"]
         return result
 
@@ -623,7 +683,7 @@ class NetHackClient:
                     "player_world_pos": None,
                     "explored_tiles": 0,
                     "seen_tiles": 0,
-                    "bounds": {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0},
+                    "bounds": {"min_row": 0, "max_row": 0, "min_col": 0, "max_col": 0},
                 },
             }
             
@@ -675,17 +735,16 @@ class NetHackClient:
                     map_info = ""
                     current_map = self.maps.get(self.current_level)
                     if current_map and current_map.player_world_pos:
-                        player_world_x, player_world_y = current_map.player_world_pos
+                        # Get direction offset from player
                         row_offset, col_offset = self._get_direction_offset(key)
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
-                        # Calculate offset from player on screen
-                        screen_row_offset = direction_row - player_row
-                        screen_col_offset = direction_col - player_col
-                        # Convert to world coordinates
-                        world_y = player_world_y - screen_row_offset
-                        world_x = player_world_x + screen_col_offset
-                        tile_obj = current_map.get_tile(world_x, world_y)
+                        
+                        # Convert absolute screen position to world coordinates
+                        # Screen center is world origin (0, 0)
+                        world_row = direction_row - screen_center_row
+                        world_col = direction_col - screen_center_col
+                        tile_obj = current_map.get_tile(world_row, world_col)
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
                             map_info = visited_str
@@ -728,6 +787,10 @@ class NetHackClient:
                     state["previous_screen"] = self.previous_screen
                     state["previous_stripped_screen"] = self.previous_stripped_screen
                     state["player_chunks_4x4"] = self._player_chunks_4x4
+                    if self._previous_player_screen_pos:
+                        state["previous_player_screen_pos"] = list(self._previous_player_screen_pos)
+                    if self._previous_player_world_pos:
+                        state["previous_player_world_pos"] = list(self._previous_player_world_pos)
                     
                     with open(self.state_file, "w") as f:
                         json.dump(state, f)
@@ -863,6 +926,8 @@ class NetHackClient:
         self.current_level = 1
         self.maps = {}
         self._player_chunks_4x4 = None
+        self._previous_player_screen_pos = None
+        self._previous_player_world_pos = None
         self.previous_screen = None
         self.previous_stripped_screen = None
         self.game_state = {}

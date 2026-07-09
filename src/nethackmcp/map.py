@@ -64,64 +64,64 @@ class DungeonMap:
     def screen_offset(self, value: tuple[int, int]):
         self._screen_offset = value
     
-    def _update_bounds(self, x: int, y: int):
+    def _update_bounds(self, row: int, col: int):
         """Update the map bounds to include the given coordinates."""
-        if self.bounds["min_x"] is None:
-            self.bounds["min_x"] = x
-            self.bounds["max_x"] = x
-            self.bounds["min_y"] = y
-            self.bounds["max_y"] = y
+        if self.bounds["min_row"] is None:
+            self.bounds["min_row"] = row
+            self.bounds["max_row"] = row
+            self.bounds["min_col"] = col
+            self.bounds["max_col"] = col
         else:
-            self.bounds["min_x"] = min(self.bounds["min_x"], x)
-            self.bounds["max_x"] = max(self.bounds["max_x"], x)
-            self.bounds["min_y"] = min(self.bounds["min_y"], y)
-            self.bounds["max_y"] = max(self.bounds["max_y"], y)
+            self.bounds["min_row"] = min(self.bounds["min_row"], row)
+            self.bounds["max_row"] = max(self.bounds["max_row"], row)
+            self.bounds["min_col"] = min(self.bounds["min_col"], col)
+            self.bounds["max_col"] = max(self.bounds["max_col"], col)
     
-    def get_tile(self, x: int, y: int) -> Tile | None:
+    def get_tile(self, row: int, col: int) -> Tile | None:
         """Get tile at given world coordinates."""
-        return self.tiles.get((x, y))
+        return self.tiles.get((row, col))
     
-    def set_tile(self, x: int, y: int, terrain: str, seen: bool = False, visited: bool = False):
+    def set_tile(self, row: int, col: int, terrain: str, seen: bool = False, visited: bool = False):
         """Set tile at given coordinates."""
         if terrain == '>':
-            self.downstairs_pos = (x, y)
+            self.downstairs_pos = (row, col)
         passable = terrain in self.PASSABLE_TERRAIN
-        self.tiles[(x, y)] = Tile(
+        self.tiles[(row, col)] = Tile(
             terrain=terrain,
             visited=visited,
             seen=seen,
             passable=passable,
         )
-        self._update_bounds(x, y)
+        self._update_bounds(row, col)
     
-    def mark_visited(self, x: int, y: int):
+    def mark_visited(self, row: int, col: int):
         """Mark tile as visited (player has stood here)."""
-        if not isinstance(x, int) or not isinstance(y, int):
-            raise ValueError(f"Coordinates must be integers, got ({type(x).__name__}, {type(y).__name__})")
+        if not isinstance(row, int) or not isinstance(col, int):
+            raise ValueError(f"Coordinates must be integers, got ({type(row).__name__}, {type(col).__name__})")
         
-        if (x, y) in self.tiles:
-            self.tiles[(x, y)].visited = True
-            self.tiles[(x, y)].seen = True
+        if (row, col) in self.tiles:
+            self.tiles[(row, col)].visited = True
+            self.tiles[(row, col)].seen = True
         else:
-            self.tiles[(x, y)] = Tile(terrain='.', visited=True, seen=True, passable=True)
+            self.tiles[(row, col)] = Tile(terrain='.', visited=True, seen=True, passable=True)
     
-    def mark_seen(self, x: int, y: int):
+    def mark_seen(self, row: int, col: int):
         """Mark tile as seen (currently visible on screen)."""
-        if not isinstance(x, int) or not isinstance(y, int):
-            raise ValueError(f"Coordinates must be integers, got ({type(x).__name__}, {type(y).__name__})")
+        if not isinstance(row, int) or not isinstance(col, int):
+            raise ValueError(f"Coordinates must be integers, got ({type(row).__name__}, {type(col).__name__})")
         
-        if (x, y) in self.tiles:
-            self.tiles[(x, y)].seen = True
+        if (row, col) in self.tiles:
+            self.tiles[(row, col)].seen = True
         else:
-            self.tiles[(x, y)] = Tile(terrain='.', visited=False, seen=True, passable=True)
+            self.tiles[(row, col)] = Tile(terrain='.', visited=False, seen=True, passable=True)
     
-    def set_player_position(self, world_x: int, world_y: int, terrain: str = '.'):
+    def set_player_position(self, world_row: int, world_col: int, terrain: str = '.'):
         """Set player's world position and mark tile as visited."""
-        self.player_world_pos = (world_x, world_y)
-        if (world_x, world_y) not in self.tiles:
-            self.set_tile(world_x, world_y, terrain)
-        self.tiles[(world_x, world_y)].visited = True
-        self.tiles[(world_x, world_y)].seen = True
+        self.player_world_pos = (world_row, world_col)
+        if (world_row, world_col) not in self.tiles:
+            self.set_tile(world_row, world_col, terrain)
+        self.tiles[(world_row, world_col)].visited = True
+        self.tiles[(world_row, world_col)].seen = True
     
     def get_explored_count(self) -> int:
         """Count tiles that have been visited."""
@@ -134,15 +134,15 @@ class DungeonMap:
     def get_unvisited_tiles(self) -> list[tuple[int, int]]:
         """Get list of unvisited tile coordinates."""
         return [
-            (x, y) for (x, y), tile in self.tiles.items()
+            (row, col) for (row, col), tile in self.tiles.items()
             if tile.visited == False and tile.passable
         ]
     
     def to_dict(self) -> dict[str, Any]:
         """Convert map to dictionary for serialization."""
         bounds = self.bounds.copy()
-        if bounds["min_x"] is None:
-            bounds = {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0}
+        if bounds["min_row"] is None:
+            bounds = {"min_row": 0, "max_row": 0, "min_col": 0, "max_col": 0}
         return {
             "level": self.level,
             "player_world_pos": self.player_world_pos,
@@ -151,8 +151,8 @@ class DungeonMap:
             "bounds": bounds,
             "downstairs_pos": self.downstairs_pos,
             "tiles": {
-                f"{x},{y}": tile.to_dict()
-                for (x, y), tile in self.tiles.items()
+                f"{row},{col}": tile.to_dict()
+                for (row, col), tile in self.tiles.items()
             },
         }
     
@@ -163,7 +163,13 @@ class DungeonMap:
         map_obj.player_world_pos = tuple(data["player_world_pos"]) if data["player_world_pos"] else None
         map_obj.player_screen_pos = tuple(data["player_screen_pos"]) if data["player_screen_pos"] else None
         map_obj._screen_offset = tuple(data["screen_offset"]) if data["screen_offset"] else None
-        map_obj.bounds = data["bounds"]
+        bounds_data = data["bounds"]
+        map_obj.bounds = {
+            "min_row": bounds_data.get("min_row", bounds_data.get("min_x")),
+            "max_row": bounds_data.get("max_row", bounds_data.get("max_x")),
+            "min_col": bounds_data.get("min_col", bounds_data.get("min_y")),
+            "max_col": bounds_data.get("max_col", bounds_data.get("max_y")),
+        }
         map_obj.downstairs_pos = tuple(data["downstairs_pos"]) if data.get("downstairs_pos") else None
         
         for (xy_str, tile_data) in data["tiles"].items():
@@ -173,17 +179,19 @@ class DungeonMap:
         return map_obj
     
     def get_terrain_at_screen_pos(self, screen_lines: list[str], screen_row: int, screen_col: int) -> str | None:
-        """Get terrain at screen position (converting from screen to world coords)."""
-        # Screen center is (0,0) in world coordinates
+        """Get terrain at screen position (converting from screen to world coords).
+        
+        World coordinates use (row, col) where both increase down/right, consistent with screen.
+        Screen center is world origin (0, 0).
+        """
         screen_center_row = len(screen_lines) // 2
         screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
         
-        screen_row_offset = screen_row - screen_center_row
-        screen_col_offset = screen_col - screen_center_col
-        world_y = -screen_row_offset
-        world_x = screen_col_offset
+        # World coords: (row, col) where + = down/right (same as screen)
+        world_row = screen_row - screen_center_row
+        world_col = screen_col - screen_center_col
         
-        tile = self.get_tile(world_x, world_y)
+        tile = self.get_tile(world_row, world_col)
         if tile:
             return tile.terrain
         return None
@@ -216,14 +224,21 @@ class DungeonMap:
         
         player_row, player_col = player_pos
         
-        # Player is at world position (0, 0)
-        world_player_y = 0
-        world_player_x = 0
+        # Screen center is world origin (0, 0)
+        screen_center_row = len(screen_lines) // 2
+        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
+        
+        # Player position in world coords (screen center is origin)
+        world_player_row = player_row - screen_center_row
+        world_player_col = player_col - screen_center_col
         
         # WHITELIST of terrain characters to include in map (geometry only)
         TERRAIN_WHITELIST = {'#', '.', '+', '-', '|', '<', '>'}
         
         # First pass: collect all visible TERRAIN from screen
+        screen_center_row = len(screen_lines) // 2
+        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
+        
         for row in range(len(screen_lines)):
             line = screen_lines[row]
             for col, char in enumerate(line):
@@ -231,20 +246,20 @@ class DungeonMap:
                     continue  # Player not terrain
                 if char not in TERRAIN_WHITELIST:
                     continue  # Items ($, u, x, etc.) not terrain
-                # Calculate world coordinates
-                world_y = player_row - row
-                world_x = col - player_col
-                map_obj.set_tile(world_x, world_y, char, seen=True)
+                # Calculate world coordinates using screen center as origin
+                world_row = row - screen_center_row
+                world_col = col - screen_center_col
+                map_obj.set_tile(world_row, world_col, char, seen=True)
         
         # Set player position
-        map_obj.player_world_pos = (world_player_x, world_player_y)
+        map_obj.player_world_pos = (world_player_row, world_player_col)
         
         # Mark player position tile
-        if (world_player_x, world_player_y) not in map_obj.tiles:
-            map_obj.set_tile(world_player_x, world_player_y, '.')
+        if (world_player_row, world_player_col) not in map_obj.tiles:
+            map_obj.set_tile(world_player_row, world_player_col, '.')
         
         # Mark player position as visited
-        map_obj.mark_visited(world_player_x, world_player_y)
+        map_obj.mark_visited(world_player_row, world_player_col)
         
         # Mark adjacent tiles as visited
         for dr in [-1, 0, 1]:
@@ -254,47 +269,47 @@ class DungeonMap:
                 r, c = player_row + dr, player_col + dc
                 if 0 <= r < len(screen_lines) and 0 <= c < len(screen_lines[r]):
                     char = screen_lines[r][c]
-                    world_y = player_row - r
-                    world_x = c - player_col
+                    world_row = r - screen_center_row
+                    world_col = c - screen_center_col
                     if char == ' ':
                         # Empty space (cave wall) adjacent to player - mark as seen AND visited
-                        map_obj.set_tile(world_x, world_y, ' ', seen=True, visited=True)
-                    elif char != '@' and (world_x, world_y) in map_obj.tiles:
+                        map_obj.set_tile(world_row, world_col, ' ', seen=True, visited=True)
+                    elif char != '@' and (world_row, world_col) in map_obj.tiles:
                         # Non-empty terrain adjacent to player - mark as visited
-                        map_obj.mark_visited(world_x, world_y)
+                        map_obj.mark_visited(world_row, world_col)
         
         return map_obj
     
     def get_map_string(self) -> str:
         """Generate a string representation of the map showing only seen terrain."""
         bounds = self.bounds
-        min_x = bounds.get("min_x", 0) if bounds.get("min_x") is not None else 0
-        max_x = bounds.get("max_x", 0) if bounds.get("max_x") is not None else 0
-        min_y = bounds.get("min_y", 0) if bounds.get("min_y") is not None else 0
-        max_y = bounds.get("max_y", 0) if bounds.get("max_y") is not None else 0
+        min_row = bounds.get("min_row", 0) if bounds.get("min_row") is not None else 0
+        max_row = bounds.get("max_row", 0) if bounds.get("max_row") is not None else 0
+        min_col = bounds.get("min_col", 0) if bounds.get("min_col") is not None else 0
+        max_col = bounds.get("max_col", 0) if bounds.get("max_col") is not None else 0
         
         # Add padding around the seen area
         padding = 2
-        min_x -= padding
-        max_x += padding
-        min_y -= padding
-        max_y += padding
+        min_row -= padding
+        max_row += padding
+        min_col -= padding
+        max_col += padding
         
         # Find all visited tiles to determine the explored region
-        visited_tiles = [(x, y) for (x, y), t in self.tiles.items() if t.visited]
+        visited_tiles = [(row, col) for (row, col), t in self.tiles.items() if t.visited]
         if visited_tiles:
-            min_x = min(min_x, min(x for x, y in visited_tiles) - padding)
-            max_x = max(max_x, max(x for x, y in visited_tiles) + padding)
-            min_y = min(min_y, min(y for x, y in visited_tiles) - padding)
-            max_y = max(max_y, max(y for x, y in visited_tiles) + padding)
+            min_row = min(min_row, min(row for row, col in visited_tiles) - padding)
+            max_row = max(max_row, max(row for row, col in visited_tiles) + padding)
+            min_col = min(min_col, min(col for row, col in visited_tiles) - padding)
+            max_col = max(max_col, max(col for row, col in visited_tiles) + padding)
         
         # Build map showing all seen tiles with actual terrain
         # Only show ? for tiles that are neither seen nor visited (completely unknown)
         map_lines = []
-        for y in range(max_y, min_y - 1, -1):  # Y goes from top (max) to bottom (min)
+        for row in range(max_row, min_row - 1, -1):  # Row goes from top (max) to bottom (min)
             line = ""
-            for x in range(min_x, max_x + 1):
-                tile = self.get_tile(x, y)
+            for col in range(min_col, max_col + 1):
+                tile = self.get_tile(row, col)
                 if tile and (tile.visited or tile.seen):
                     # Show actual terrain
                     terrain = tile.terrain
@@ -303,7 +318,7 @@ class DungeonMap:
                         terrain = 'X'
                     elif terrain == ' ' and not tile.visited:
                         terrain = ' '
-                    elif (x, y) == self.player_world_pos:
+                    elif (row, col) == self.player_world_pos:
                         terrain = terrain
                     line += terrain
                 else:
