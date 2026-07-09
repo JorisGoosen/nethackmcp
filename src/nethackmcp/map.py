@@ -64,6 +64,51 @@ class DungeonMap:
     def screen_offset(self, value: tuple[int, int]):
         self._screen_offset = value
     
+    def _get_neighbor(self, row: int, col: int) -> str | None:
+        """Get terrain at neighbor coordinates, or None if not found."""
+        tile = self.get_tile(row, col)
+        return tile.terrain if tile else None
+    
+    def _is_terrain_passable(self, row: int, col: int) -> bool:
+        """Check if terrain at given coordinates is passable based on wall/door logic.
+        
+        -#', '.', '+', '>' are always passable
+        -'-' is passable only if above and below are both '|'
+        -'|' is passable only if left and right are both '-'
+        -Other terrain (' ', '<') is not passable
+        """
+        tile = self.get_tile(row, col)
+        if not tile:
+            return False
+        
+        terrain = tile.terrain
+        
+        if terrain in self.PASSABLE_TERRAIN:
+            return True
+        
+        if terrain == '-':
+            above = self._get_neighbor(row - 1, col)
+            below = self._get_neighbor(row + 1, col)
+            return above == '|' and below == '|'
+        
+        if terrain == '|':
+            left = self._get_neighbor(row, col - 1)
+            right = self._get_neighbor(row, col + 1)
+            return left == '-' and right == '-'
+        
+        return False
+    
+    def _is_adjacent_to_passable(self, row: int, col: int) -> bool:
+        """Check if a tile has at least one passable neighbor (including diagonals)."""
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                neighbor_terrain = self._get_neighbor(row + dr, col + dc)
+                if neighbor_terrain and self._is_terrain_passable(row + dr, col + dc):
+                    return True
+        return False
+    
     def _update_bounds(self, row: int, col: int):
         """Update the map bounds to include the given coordinates."""
         if self.bounds["min_row"] is None:
@@ -296,23 +341,29 @@ class DungeonMap:
             max_col = max(max_col, max(c for r, c in visited_tiles) + padding)
         
         # Build map showing all seen tiles with actual terrain
-        # Only show ? for tiles that are neither seen nor visited (completely unknown)
+        # Show ? only for empty tiles (' ') that are adjacent to passable terrain
         map_lines = []
         for row in range(min_row, max_row + 1):  # Row goes from top (min) to bottom (max)
             line = ""
             for col in range(min_col, max_col + 1):
                 tile = self.get_tile(row, col)
+                
+                # Determine terrain to display
                 if tile and (tile.visited or tile.seen):
                     terrain = tile.terrain
                     if terrain == ' ' and tile.visited:
                         terrain = 'X'
-                    elif terrain == ' ' and not tile.visited:
-                        terrain = ' '
-                    elif (row, col) == self.player_world_pos:
-                        terrain = terrain
-                    line += terrain
+                elif tile:
+                    terrain = tile.terrain
                 else:
-                    line += '?'  # completely unknown - show ?
+                    terrain = ' '
+                
+                # If terrain is ' ' (empty), check if adjacent to passable terrain
+                if terrain == ' ' and self._is_adjacent_to_passable(row, col):
+                    terrain = '?'
+                
+                line += terrain
+            
             map_lines.append(line)
         
         return "\n".join(map_lines)
