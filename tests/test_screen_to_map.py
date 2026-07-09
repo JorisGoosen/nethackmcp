@@ -66,7 +66,8 @@ class TestScreenToMap(unittest.TestCase):
         """Test that all visible terrain tiles are marked as seen."""
         screen = [
             "-----------",
-            "|..@..",
+            "|...@...",
+            "-----------",
         ]
         
         map_obj = DungeonMap.from_screen(screen)
@@ -76,9 +77,9 @@ class TestScreenToMap(unittest.TestCase):
         # In world coords (player at x=0): x=-2, -1, 1, 2
         
         # Just verify some tiles exist
-        self.assertIsNotNone(map_obj.get_tile(0, 0))  # Player
-        self.assertIsNotNone(map_obj.get_tile(-1, 0))  # Left of player
-        self.assertIsNotNone(map_obj.get_tile(1, 0))  # Right of player
+        self.assertIsNotNone(map_obj.get_tile(0, 0))  # Player at (0,0)
+        self.assertIsNotNone(map_obj.get_tile(-1, 0))  # 1 row above player
+        self.assertIsNotNone(map_obj.get_tile(1, 0))  # 1 row below player
 
     def test_from_screen_bounds_expansion(self):
         """Test that map bounds expand to cover all screen tiles."""
@@ -92,10 +93,10 @@ class TestScreenToMap(unittest.TestCase):
         map_obj = DungeonMap.from_screen(screen)
         
         # Bounds should cover the visible area
-        self.assertIsNotNone(map_obj.bounds["min_x"])
-        self.assertIsNotNone(map_obj.bounds["max_x"])
-        self.assertIsNotNone(map_obj.bounds["min_y"])
-        self.assertIsNotNone(map_obj.bounds["max_y"])
+        self.assertIsNotNone(map_obj.bounds["min_row"])
+        self.assertIsNotNone(map_obj.bounds["max_row"])
+        self.assertIsNotNone(map_obj.bounds["min_col"])
+        self.assertIsNotNone(map_obj.bounds["max_col"])
 
     def test_from_screen_adjacent_tiles_visited(self):
         """Test that tiles adjacent to player are marked as visited."""

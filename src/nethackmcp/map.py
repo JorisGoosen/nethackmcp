@@ -43,10 +43,10 @@ class DungeonMap:
         self.level = level
         self.tiles: dict[tuple[int, int], Tile] = {}
         self.bounds = {
-            "min_x": None,
-            "max_x": None,
-            "min_y": None,
-            "max_y": None,
+            "min_row": None,
+            "max_row": None,
+            "min_col": None,
+            "max_col": None,
         }
         self.player_world_pos: tuple[int, int] | None = None
         self.player_screen_pos: tuple[int, int] | None = None  # (row, col) on screen
@@ -224,20 +224,11 @@ class DungeonMap:
         
         player_row, player_col = player_pos
         
-        # Screen center is world origin (0, 0)
-        screen_center_row = len(screen_lines) // 2
-        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
-        
-        # Player position in world coords (screen center is origin)
-        world_player_row = player_row - screen_center_row
-        world_player_col = player_col - screen_center_col
+        # Player is ALWAYS at world origin (0, 0) in from_screen
+        # All tiles are offset relative to player position
         
         # WHITELIST of terrain characters to include in map (geometry only)
         TERRAIN_WHITELIST = {'#', '.', '+', '-', '|', '<', '>'}
-        
-        # First pass: collect all visible TERRAIN from screen
-        screen_center_row = len(screen_lines) // 2
-        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
         
         for row in range(len(screen_lines)):
             line = screen_lines[row]
@@ -246,31 +237,32 @@ class DungeonMap:
                     continue  # Player not terrain
                 if char not in TERRAIN_WHITELIST:
                     continue  # Items ($, u, x, etc.) not terrain
-                # Calculate world coordinates using screen center as origin
-                world_row = row - screen_center_row
-                world_col = col - screen_center_col
+                # Calculate world coordinates: tile is offset from player position
+                # Player is at screen (player_row, player_col) and world (0, 0)
+                world_row = row - player_row
+                world_col = col - player_col
                 map_obj.set_tile(world_row, world_col, char, seen=True)
         
-        # Set player position
-        map_obj.player_world_pos = (world_player_row, world_player_col)
+        # Set player position at world origin (0, 0)
+        map_obj.player_world_pos = (0, 0)
         
-        # Mark player position tile
-        if (world_player_row, world_player_col) not in map_obj.tiles:
-            map_obj.set_tile(world_player_row, world_player_col, '.')
+        # Mark player position tile (always at world origin in from_screen)
+        if (0, 0) not in map_obj.tiles:
+            map_obj.set_tile(0, 0, '.')
         
         # Mark player position as visited
-        map_obj.mark_visited(world_player_row, world_player_col)
+        map_obj.mark_visited(0, 0)
         
         # Mark adjacent tiles as visited
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
                 if dr == 0 and dc == 0:
                     continue
-                r, c = player_row + dr, player_col + dc
-                if 0 <= r < len(screen_lines) and 0 <= c < len(screen_lines[r]):
-                    char = screen_lines[r][c]
-                    world_row = r - screen_center_row
-                    world_col = c - screen_center_col
+                adj_player_row, adj_player_col = player_row + dr, player_col + dc
+                if 0 <= adj_player_row < len(screen_lines) and 0 <= adj_player_col < len(screen_lines[adj_player_row]):
+                    char = screen_lines[adj_player_row][adj_player_col]
+                    world_row = adj_player_row - player_row
+                    world_col = adj_player_col - player_col
                     if char == ' ':
                         # Empty space (cave wall) adjacent to player - mark as seen AND visited
                         map_obj.set_tile(world_row, world_col, ' ', seen=True, visited=True)
@@ -298,10 +290,10 @@ class DungeonMap:
         # Find all visited tiles to determine the explored region
         visited_tiles = [(row, col) for (row, col), t in self.tiles.items() if t.visited]
         if visited_tiles:
-            min_row = min(min_row, min(row for row, col in visited_tiles) - padding)
-            max_row = max(max_row, max(row for row, col in visited_tiles) + padding)
-            min_col = min(min_col, min(col for row, col in visited_tiles) - padding)
-            max_col = max(max_col, max(col for row, col in visited_tiles) + padding)
+            min_row = min(min_row, min(r for r, col in visited_tiles) - padding)
+            max_row = max(max_row, max(r for r, col in visited_tiles) + padding)
+            min_col = min(min_col, min(c for r, c in visited_tiles) - padding)
+            max_col = max(max_col, max(c for r, c in visited_tiles) + padding)
         
         # Build map showing all seen tiles with actual terrain
         # Only show ? for tiles that are neither seen nor visited (completely unknown)
@@ -311,9 +303,7 @@ class DungeonMap:
             for col in range(min_col, max_col + 1):
                 tile = self.get_tile(row, col)
                 if tile and (tile.visited or tile.seen):
-                    # Show actual terrain
                     terrain = tile.terrain
-                    # Only show X for visited rockwalls (spaces)
                     if terrain == ' ' and tile.visited:
                         terrain = 'X'
                     elif terrain == ' ' and not tile.visited:

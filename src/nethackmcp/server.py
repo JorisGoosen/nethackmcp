@@ -290,14 +290,6 @@ class NetHackClient:
         
         current_map = self.maps[self.current_level]
         
-        # Calculate screen center (world origin)
-        screen_center_row = len(screen_lines) // 2
-        screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
-        
-        # Player position in world coordinates (screen center is origin)
-        player_world_row = player_row - screen_center_row
-        player_world_col = player_col - screen_center_col
-        
         # Extract terrain from screen (filter out status bars)
         game_start = 6
         game_end = 15
@@ -306,10 +298,11 @@ class NetHackClient:
         current_player_screen_pos = (player_row, player_col)
         
         if self._player_chunks_4x4 is None:
-            # First frame - initialize
-            current_map.set_player_position(player_world_row, player_world_col, '.')
+            # First frame - player starts at world origin (0, 0)
+            current_map.set_player_position(0, 0, '.')
             self._player_chunks_4x4 = current_player_screen_pos
-            self._previous_player_world_pos = (player_world_row, player_world_col)
+            self._previous_player_world_pos = (0, 0)
+            self._previous_player_screen_pos = current_player_screen_pos
             
             # Store actual terrain at player position
             if player_row >= 0 and player_row < len(screen_lines):
@@ -317,9 +310,9 @@ class NetHackClient:
                 if player_col >= 0 and player_col < len(line):
                     terrain = line[player_col]
                     if terrain != '@':
-                        current_map.set_tile(player_world_row, player_world_col, terrain)
+                        current_map.set_tile(0, 0, terrain)
             
-            result["player_world_pos"] = [player_world_row, player_world_col]
+            result["player_world_pos"] = [0, 0]
         else:
             # Extract 4x4 terrain chunks from multiple positions to detect movement
             offsets_to_check = [
@@ -376,9 +369,6 @@ class NetHackClient:
                 result["screen_shifted"] = True
                 result["player_moved_world"] = True
                 result["map_updated"] = True
-                
-                # Update player world position
-                current_map.set_player_position(player_world_row, player_world_col, '.')
             else:
                 # Screen hasn't shifted significantly, check if player moved
                 # by comparing player screen position with previous frame
@@ -388,13 +378,15 @@ class NetHackClient:
                     screen_col_delta = player_col - prev_col
                     
                     if screen_row_delta != 0 or screen_col_delta != 0:
-                        # Player moved relative to screen
-                        current_map.set_player_position(player_world_row, player_world_col, '.')
+                        # Player moved relative to screen - update absolute world position
+                        if current_map.player_world_pos:
+                            current_map.player_world_pos = (
+                                current_map.player_world_pos[0] + screen_row_delta,
+                                current_map.player_world_pos[1] + screen_col_delta
+                            )
                         result["player_moved_world"] = True
                         result["map_updated"] = True
             
-            # Update stored positions for next iteration
-            self._player_chunks_4x4 = current_player_screen_pos
             self._previous_player_screen_pos = current_player_screen_pos
         
         player_world_row, player_world_col = current_map.player_world_pos or (0, 0)
@@ -405,9 +397,12 @@ class NetHackClient:
             for col, char in enumerate(line):
                 if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
                     # Convert screen coords to world coords
-                    # Screen center is world origin (0, 0)
-                    world_row = row - screen_center_row
-                    world_col = col - screen_center_col
+                    # Player is at screen (player_row, player_col) and world (player_world_row, player_world_col)
+                    # Tile at screen (row, col) has world coords:
+                    # world_row = (row - player_row) + player_world_row
+                    # world_col = (col - player_col) + player_world_col
+                    world_row = (row - player_row) + player_world_row
+                    world_col = (col - player_col) + player_world_col
                     current_map.set_tile(world_row, world_col, char, seen=True)
         
         current_map.mark_visited(player_world_row, player_world_col)
