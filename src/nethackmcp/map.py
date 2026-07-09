@@ -298,7 +298,7 @@ class DungeonMap:
         # Build map showing all seen tiles with actual terrain
         # Only show ? for tiles that are neither seen nor visited (completely unknown)
         map_lines = []
-        for row in range(max_row, min_row - 1, -1):  # Row goes from top (max) to bottom (min)
+        for row in range(min_row, max_row + 1):  # Row goes from top (min) to bottom (max)
             line = ""
             for col in range(min_col, max_col + 1):
                 tile = self.get_tile(row, col)
