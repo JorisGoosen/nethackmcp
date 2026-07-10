@@ -7,11 +7,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from nethackmcp.server import start_server
+from nethackmcp.server import main
 
 
 async def main():
-    await start_server()
+    main()
 
 
 if __name__ == "__main__":

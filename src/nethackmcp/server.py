@@ -68,7 +68,7 @@ class NetHackClient:
     def __init__(self):
         self.session_name: str | None = None
         self.state_file: str | None = None
-        self.current_goal: str = "Explore"
+        self.current_goal: str = "Explore ?"
         self.goal_counter: int = 0
         self.goal_locked_until_counter: int = -1
         self.game_state: dict[str, Any] = {}
@@ -291,8 +291,9 @@ class NetHackClient:
         current_map = self.maps[self.current_level]
         
         # Extract terrain from screen (filter out status bars)
-        game_start = 6
-        game_end = 15
+        # Changed from 6/15 to 0/23 to capture all terrain including stairs
+        game_start = 0
+        game_end = 23
         
         # Store current player screen position for next comparison
         current_player_screen_pos = (player_row, player_col)
@@ -743,11 +744,25 @@ class NetHackClient:
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
                             map_info = visited_str
-                    
+                            # Check if terrain is actually passable (for doors)
+                            is_passable = current_map._is_terrain_passable(world_row, world_col)
+                            if tile in ['|', '-'] and is_passable:
+                                tile = '+'  # Show as door instead of wall
                     hints_lines.append(f"`{key}`:'{tile}'{map_info}")
                 
-                blocked_tiles = {' ', '|', '-'}
-                allowed_keys = [key for key, tile in direction_tiles.items() if tile not in blocked_tiles]
+                blocked_tiles = {' ', '<'}
+                allowed_keys = []
+                for key, tile in direction_tiles.items():
+                    # Check actual passability via map
+                    current_map = self.maps.get(self.current_level)
+                    if current_map and current_map.player_world_pos:
+                        row_offset, col_offset = self._get_direction_offset(key)
+                        world_row = (player_row + row_offset) - screen_center_row
+                        world_col = (player_col + col_offset) - screen_center_col
+                        if current_map._is_terrain_passable(world_row, world_col):
+                            allowed_keys.append(key)
+                    elif tile not in blocked_tiles:
+                        allowed_keys.append(key)
                 
                 hints_lines.extend([
                     "",
@@ -760,6 +775,13 @@ class NetHackClient:
                 
                 state["hints"] = "\n".join(hints_lines)
                 state["direction_tiles"] = direction_tiles
+                
+                # Add map after hints with big header
+                if player_row >= 0:
+                    map_result = self._show_map()
+                    if map_result.get("status") == "success":
+                        map_header = "\n\n###### MIND MAP ######\n"
+                        state["hints"] = state["hints"] + map_header + map_result.get("map", "")
 
             # Update state file
             if self.state_file:
@@ -833,20 +855,7 @@ class NetHackClient:
         
         return result
     
-    def _is_player_adjacent(self, current_map: DungeonMap, tile_x: int, tile_y: int) -> bool:
-        """Check if the player is adjacent to the given tile (including diagonals)."""
-        if current_map.player_world_pos is None:
-            return False
-        
-        player_x, player_y = current_map.player_world_pos
-        # Check all 8 surrounding tiles
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                if dx == 0 and dy == 0:
-                    continue
-                if player_x == tile_x + dx and player_y == tile_y + dy:
-                    return True
-        return False
+
 
     def stop_game(self) -> dict[str, Any]:
         """Stop the current game."""

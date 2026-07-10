@@ -326,7 +326,7 @@ class DungeonMap:
         max_col = bounds.get("max_col", 0) if bounds.get("max_col") is not None else 0
         
         # Add padding around the seen area
-        padding = 2
+        padding = 5
         min_row -= padding
         max_row += padding
         min_col -= padding
