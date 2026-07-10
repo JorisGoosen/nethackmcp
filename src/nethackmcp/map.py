@@ -127,16 +127,28 @@ class DungeonMap:
         return self.tiles.get((row, col))
     
     def set_tile(self, row: int, col: int, terrain: str, seen: bool = False, visited: bool = False):
-        """Set tile at given coordinates."""
+        """Set tile at given coordinates. Preserves existing tile data if tile exists."""
+        existing_tile = self.tiles.get((row, col))
+        
         if terrain == '>':
             self.downstairs_pos = (row, col)
-        passable = terrain in self.PASSABLE_TERRAIN
-        self.tiles[(row, col)] = Tile(
-            terrain=terrain,
-            visited=visited,
-            seen=seen,
-            passable=passable,
-        )
+        
+        if existing_tile:
+            passable = terrain in self.PASSABLE_TERRAIN
+            self.tiles[(row, col)] = Tile(
+                terrain=terrain if existing_tile.terrain != ' ' else existing_tile.terrain,
+                visited=visited or existing_tile.visited,
+                seen=seen or existing_tile.seen,
+                passable=passable,
+            )
+        else:
+            passable = terrain in self.PASSABLE_TERRAIN
+            self.tiles[(row, col)] = Tile(
+                terrain=terrain,
+                visited=visited,
+                seen=seen,
+                passable=passable,
+            )
         self._update_bounds(row, col)
     
     def mark_visited(self, row: int, col: int):
@@ -145,11 +157,11 @@ class DungeonMap:
             raise ValueError(f"Coordinates must be integers, got ({type(row).__name__}, {type(col).__name__})")
         
         if (row, col) in self.tiles:
-            self.tiles[(row, col)].visited = True
-            self.tiles[(row, col)].seen = True
-            # Convert empty spaces to X when visited
-            if self.tiles[(row, col)].terrain == ' ':
-                self.tiles[(row, col)].terrain = 'X'
+            tile = self.tiles[(row, col)]
+            tile.visited = True
+            tile.seen = True
+            if tile.terrain == ' ':
+                tile.terrain = 'X'
         else:
             self.tiles[(row, col)] = Tile(terrain='.', visited=True, seen=True, passable=True)
     

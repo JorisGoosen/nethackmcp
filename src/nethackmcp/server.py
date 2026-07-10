@@ -404,7 +404,12 @@ class NetHackClient:
                     # world_col = (col - player_col) + player_world_col
                     world_row = (row - player_row) + player_world_row
                     world_col = (col - player_col) + player_world_col
-                    current_map.set_tile(world_row, world_col, char, seen=True)
+                    # Check if tile already exists and is visited - if so, preserve terrain (especially ' ' -> 'X')
+                    existing_tile = current_map.get_tile(world_row, world_col)
+                    if existing_tile and existing_tile.visited:
+                        current_map.mark_visited(world_row, world_col)
+                    else:
+                        current_map.set_tile(world_row, world_col, char, seen=True)
         
         current_map.mark_visited(player_world_row, player_world_col)
         
