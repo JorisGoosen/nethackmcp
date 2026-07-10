@@ -147,6 +147,9 @@ class DungeonMap:
         if (row, col) in self.tiles:
             self.tiles[(row, col)].visited = True
             self.tiles[(row, col)].seen = True
+            # Convert empty spaces to X when visited
+            if self.tiles[(row, col)].terrain == ' ':
+                self.tiles[(row, col)].terrain = 'X'
         else:
             self.tiles[(row, col)] = Tile(terrain='.', visited=True, seen=True, passable=True)
     
@@ -354,8 +357,6 @@ class DungeonMap:
                 # Determine terrain to display (always exactly 1 character)
                 if tile and (tile.visited or tile.seen):
                     terrain = tile.terrain
-                    if terrain == ' ' and tile.visited:
-                        terrain = 'X'
                 elif tile:
                     terrain = tile.terrain
                 else:
@@ -365,8 +366,10 @@ class DungeonMap:
                 if terrain is None or len(terrain) != 1:
                     terrain = ' '
                 
-                # If terrain is ' ' (empty), check if adjacent to passable terrain
-                if terrain == ' ' and self._is_adjacent_to_passable(row, col):
+                # Convert empty spaces: X if visited, ? if adjacent to passable terrain
+                if terrain == ' ' and tile and tile.visited:
+                    terrain = 'X'
+                elif terrain == ' ' and self._is_adjacent_to_passable(row, col):
                     terrain = '?'
                 
                 line += terrain
