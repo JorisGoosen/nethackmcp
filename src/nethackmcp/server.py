@@ -1013,11 +1013,6 @@ async def handle_list_tools() -> list[types.Tool]:
             description="Get the difference between current and previous screen",
             inputSchema={"type": "object", "properties": {}},
         ),
-        types.Tool(
-            name="nethack_show_map",
-            description="Show a text representation of the current dungeon map",
-            inputSchema={"type": "object", "properties": {}},
-        ),
     ]
 
 
@@ -1133,19 +1128,6 @@ async def handle_call_tool(
             diff = state.get("diff", "No diff available")
             print(f"[AI CALL RESULT] {name}: {diff}", file=sys.stderr, flush=True)
             return [types.TextContent(type="text", text=f"```\n{diff}\n```")]
-
-        elif name == "nethack_show_map":
-            result = await asyncio.to_thread(client._show_map)
-            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-            if result.get("status") == "success":
-                map_output = f"Map for Level {result['level']}\n"
-                map_output += f"Explored: {result['explored_tiles']} tiles | Seen: {result['seen_tiles']} tiles\n"
-                map_output += f"Player (world): {result['player_world_pos']}\n"
-                map_output += f"Downstairs: {result['downstairs_pos']}\n\n"
-                map_output += result['map']
-                return [types.TextContent(type="text", text=f"```\n{map_output}\n```")]
-            else:
-                return [types.TextContent(type="text", text=f"```\n{result['error']}\n```")]
 
         else:
             error_result = {"error": f"Unknown tool: {name}"}
