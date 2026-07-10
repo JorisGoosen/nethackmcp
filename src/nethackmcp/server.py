@@ -736,10 +736,10 @@ class NetHackClient:
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
                         
-                        # Convert absolute screen position to world coordinates
-                        # Screen center is world origin (0, 0)
-                        world_row = direction_row - screen_center_row
-                        world_col = direction_col - screen_center_col
+                        # Convert screen position to world coordinates
+                        # World = (screen_offset_from_player) + player_world_pos
+                        world_row = (direction_row - player_row) + current_map.player_world_pos[0]
+                        world_col = (direction_col - player_col) + current_map.player_world_pos[1]
                         tile_obj = current_map.get_tile(world_row, world_col)
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
@@ -757,11 +757,16 @@ class NetHackClient:
                     current_map = self.maps.get(self.current_level)
                     if current_map and current_map.player_world_pos:
                         row_offset, col_offset = self._get_direction_offset(key)
-                        world_row = (player_row + row_offset) - screen_center_row
-                        world_col = (player_col + col_offset) - screen_center_col
-                        if current_map._is_terrain_passable(world_row, world_col):
+                        direction_row = player_row + row_offset
+                        direction_col = player_col + col_offset
+                        # Convert screen coordinates to world coordinates
+                        world_row = (direction_row - player_row) + current_map.player_world_pos[0]
+                        world_col = (direction_col - player_col) + current_map.player_world_pos[1]
+                        is_passable = current_map._is_terrain_passable(world_row, world_col)
+                        # Debug: print(f"DIR {key}: tile='{tile}' world=({world_row},{world_col}) passable={is_passable}")
+                        if is_passable:
                             allowed_keys.append(key)
-                    elif tile not in blocked_tiles:
+                    elif tile not in blocked_tiles and tile != '-':
                         allowed_keys.append(key)
                 
                 hints_lines.extend([
