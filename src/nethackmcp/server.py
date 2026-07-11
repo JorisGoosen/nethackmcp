@@ -20,6 +20,7 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
 from nethackmcp.map import DungeonMap, Tile
+from nethackmcp.simple_odometry import SimpleOdometry
 
 SERVER_INSTRUCTIONS = """\
 You are connected to NetHack through this MCP server.
@@ -81,10 +82,13 @@ class NetHackClient:
         self.previous_screen: str | None = None
         self.previous_stripped_screen: list[str] | None = None
         
-        # Terrain chunk tracking for movement detection
-        self._player_chunks_4x4: list[list[str]] | None = None  # 4x4 terrain chunk from previous frame
-        self._previous_player_screen_pos: tuple[int, int] | None = None  # Player screen pos from previous frame
-        self._previous_player_world_pos: tuple[int, int] | None = None  # Player world pos from previous frame
+        # Terrain chunk tracking for movement detection (deprecated, kept for backwards compatibility)
+        self._player_chunks_4x4: list[list[str]] | None = None
+        self._previous_player_screen_pos: tuple[int, int] | None = None
+        self._previous_player_world_pos: tuple[int, int] | None = None
+        
+        # Visual odometry system for robust positioning
+        self._simple_odom: SimpleOdometry | None = None
         
         # Restore state from existing state file (but NOT NetHack save files)
         existing_state = self._find_existing_state()
@@ -112,6 +116,16 @@ class NetHackClient:
                         self._previous_player_screen_pos = tuple(state["previous_player_screen_pos"])
                     if "previous_player_world_pos" in state:
                         self._previous_player_world_pos = tuple(state["previous_player_world_pos"])
+                    
+                    # Restore visual odometry state if available
+                    if "simple_odometry_state" in state:
+                        try:
+                            odom_state = state["simple_odometry_state"]
+                            self._simple_odom = SimpleOdometry()
+                            # Simple odom just needs to know initial player pos
+                            # We'll set it when we get the first screen
+                        except Exception:
+                            pass
                     
                     self.game_state = state
             except Exception:
@@ -427,6 +441,77 @@ class NetHackClient:
         result["player_world_pos"] = [player_world_row, player_world_col] if current_map.player_world_pos else [0, 0]
         result["map_updated"] = result["map_updated"] or result["player_moved_world"]
         return result
+    
+    def _update_map_from_screen_odom(
+        self,
+        screen_lines: list[str],
+        player_row: int,
+        player_col: int,
+        world_row: float,
+        world_col: float
+    ) -> dict[str, Any]:
+        """
+        Update map using odometry-derived world position instead of screen-based calculation.
+        
+        Args:
+            screen_lines: Current screen state
+            player_row, player_col: Player position on screen
+            world_row, world_col: Position from visual odometry
+        """
+        result = {
+            "player_world_pos": None,
+            "map_updated": False,
+            "player_moved_world": False,
+            "screen_shifted": False,
+        }
+        
+        # Get or create map for current level
+        if self.current_level not in self.maps:
+            self.maps[self.current_level] = DungeonMap(level=self.current_level)
+        
+        current_map = self.maps[self.current_level]
+        
+        # Extract terrain from screen
+        game_start = 0
+        game_end = 23
+        
+        # Use odometry-derived world position directly
+        current_map.player_world_pos = (int(world_row), int(world_col))
+        result["player_world_pos"] = [int(world_row), int(world_col)]
+        result["player_moved_world"] = True
+        result["map_updated"] = True
+        
+        # Update map with terrain from current screen using odometry position
+        for row in range(game_start, min(game_end + 1, len(screen_lines))):
+            line = screen_lines[row]
+            for col, char in enumerate(line):
+                if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
+                    # Convert screen coords to world coords using odometry position
+                    # world_row = (row - player_row) + player_world_row
+                    world_r = (row - player_row) + current_map.player_world_pos[0]
+                    world_c = (col - player_col) + current_map.player_world_pos[1]
+                    
+                    existing_tile = current_map.get_tile(world_r, world_c)
+                    if existing_tile and existing_tile.visited:
+                        current_map.mark_visited(world_r, world_c)
+                    else:
+                        current_map.set_tile(world_r, world_c, char, seen=True)
+        
+        # Mark player position as visited
+        current_map.mark_visited(current_map.player_world_pos[0], current_map.player_world_pos[1])
+        
+        # Mark adjacent spaces as visited
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                adj_world_row = current_map.player_world_pos[0] + dr
+                adj_world_col = current_map.player_world_pos[1] + dc
+                tile = current_map.get_tile(adj_world_row, adj_world_col)
+                if tile and tile.terrain == ' ':
+                    current_map.mark_visited(adj_world_row, adj_world_col)
+        
+        return result
 
     def start_game(self, character: str = "random") -> dict[str, Any]:
         """Start a new NetHack game."""
@@ -658,9 +743,24 @@ class NetHackClient:
             if new_level is not None and new_level != self.current_level:
                 self.current_level = new_level
             
+            # Initialize visual odometry if needed
+            if self._simple_odom is None and player_row >= 0 and player_col >= 0:
+                self._simple_odom = SimpleOdometry()
+            
             # Update map from screen (only if player was found)
             if player_row >= 0 and player_col >= 0:
-                map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
+                # Use visual odometry for positioning if available
+                if self._simple_odom is not None:
+                    world_row, world_col, odom_confidence = self._simple_odom.update(
+                        screen_lines, player_row, player_col
+                    )
+                    
+                    map_result = self._update_map_from_screen_odom(
+                        screen_lines, player_row, player_col, world_row, world_col
+                    )
+                    map_result["odometry_confidence"] = odom_confidence
+                else:
+                    map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
             else:
                 map_result = {"error": "Player position not found on screen"}
             
@@ -679,12 +779,14 @@ class NetHackClient:
                     "explored_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_explored_count(),
                     "seen_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_seen_count(),
                     "bounds": self.maps.get(self.current_level, DungeonMap(self.current_level)).bounds,
+                    "odometry_confidence": map_result.get("odometry_confidence"),
                 } if self.maps else {
                     "level": self.current_level,
                     "player_world_pos": None,
                     "explored_tiles": 0,
                     "seen_tiles": 0,
                     "bounds": {"min_row": 0, "max_row": 0, "min_col": 0, "max_col": 0},
+                    "odometry_confidence": None,
                 },
             }
             
@@ -819,6 +921,15 @@ class NetHackClient:
                     if self._previous_player_world_pos:
                         state["previous_player_world_pos"] = list(self._previous_player_world_pos)
                     
+                    # Save visual odometry state
+                    if self._simple_odom is not None:
+                        state["simple_odometry_state"] = {
+                            "row": self._simple_odom.state.row,
+                            "col": self._simple_odom.state.col,
+                            "heading": self._simple_odom.state.heading,
+                            "keyframe_counter": self._simple_odom._keyframe_counter
+                        }
+                    
                     with open(self.state_file, "w") as f:
                         json.dump(state, f)
                 except Exception:
@@ -942,6 +1053,7 @@ class NetHackClient:
         self._player_chunks_4x4 = None
         self._previous_player_screen_pos = None
         self._previous_player_world_pos = None
+        self._simple_odom = None
         self.previous_screen = None
         self.previous_stripped_screen = None
         self.game_state = {}
