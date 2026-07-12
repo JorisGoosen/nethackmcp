@@ -50,7 +50,16 @@ You are connected to NetHack through this MCP server.
 3. Check screen state with nethack_state to see what's happening
 4. Stop with nethack_stop when done
 
+## Tile legend:
+- `@` you
+- `.` floor | `#` cavefloor | `+` door (all passable)
+- `>` stairs down (passable)
+- `| -` walls | ` ` rockwall | `<` stairs up (all impassable)
+- `X` visited rockwall | `?` unexplored adjacent
+
 ## Important:
+The state hints show what is in each direction from `@` with visited status.
+Only move into passable directions listed under "Move:".
 
 The server maintains game state using tmux sessions. Each game gets its own tmux session.
 """
@@ -727,97 +736,67 @@ class NetHackClient:
             
             # Add hints if player position found (use stripped text for tile detection)
             if player_row >= 0:
+                direction_tiles = self._get_direction_tiles(screen_lines, player_row, player_col)
+
                 hints_lines = [
                     "HINTS",
-                    "@ Has the following next tiles behind the movement keys:",
-                    "",
-                    "Legend:",
-                    "'@' => you",
-                    "'d' => could be your dog, if so dont worry about it blocking you, you'll swap places on movement, this is OK",
-                    "'>' => stairs down (passable and where you want to go!)",
-                    "'#' => cavefloor (passable)",
-                    "'.' => tilefloor (passable)",
-                    "'+' => door (passable)",
-                    "'|' => wall (impassable)",
-                    "'-' => wall (impassable)",
-                    "' ' => rockwall (impassable, YES THE EMPTY SPACE IS IMPASSABLE!)",
-                    "'<' => stairs up (impassable)",
-                    "",
-                    f"Level: {self.current_level}",
-                    f"Player (world): {self.maps.get(self.current_level, DungeonMap(self.current_level)).player_world_pos}",
-                    f"Downstairs: {self.maps.get(self.current_level, DungeonMap(self.current_level)).downstairs_pos}",
-                    f"Explored: {self.maps.get(self.current_level, DungeonMap(self.current_level)).get_explored_count()} tiles",
-                    f"Seen: {self.maps.get(self.current_level, DungeonMap(self.current_level)).get_seen_count()} tiles",
                     "",
                 ]
-                
-                direction_tiles = self._get_direction_tiles(screen_lines, player_row, player_col)
-                
-                # Screen center is (0,0) in world coordinates
-                screen_center_row = len(screen_lines) // 2
-                screen_center_col = max(len(line) for line in screen_lines) // 2 if screen_lines else 40
-                
+
                 for key in "hjklynub":
                     tile = direction_tiles.get(key, " ")
-                    
+
                     # Check if we have map info for this direction
                     map_info = ""
                     current_map = self.maps.get(self.current_level)
                     if current_map and current_map.player_world_pos:
-                        # Get direction offset from player
                         row_offset, col_offset = self._get_direction_offset(key)
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
-                        
-                        # Convert screen position to world coordinates using dungeon_offset
+
                         world_row = current_map.dungeon_offset[0] + direction_row
                         world_col = current_map.dungeon_offset[1] + direction_col
                         tile_obj = current_map.get_tile(world_row, world_col)
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
                             map_info = visited_str
-                            # Check if terrain is actually passable (for doors)
                             is_passable = current_map._is_terrain_passable(world_row, world_col)
                             if tile in ['|', '-'] and is_passable:
-                                tile = '+'  # Show as door instead of wall
-                    hints_lines.append(f"`{key}`:'{tile}'{map_info}")
-                
+                                tile = '+'
+                    hints_lines.append(f"`{key}`:{tile}{map_info}")
+
                 blocked_tiles = {' ', '<'}
                 allowed_keys = []
                 for key, tile in direction_tiles.items():
-                    # Check actual passability via map
                     current_map = self.maps.get(self.current_level)
                     if current_map and current_map.player_world_pos:
                         row_offset, col_offset = self._get_direction_offset(key)
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
-                        # Convert screen coordinates to world coordinates using dungeon_offset
                         world_row = current_map.dungeon_offset[0] + direction_row
                         world_col = current_map.dungeon_offset[1] + direction_col
                         is_passable = current_map._is_terrain_passable(world_row, world_col)
-                        # Debug: print(f"DIR {key}: tile='{tile}' world=({world_row},{world_col}) passable={is_passable}")
                         if is_passable:
                             allowed_keys.append(key)
                     elif tile not in blocked_tiles and tile != '-':
                         allowed_keys.append(key)
-                
+
                 hints_lines.extend([
                     "",
-                    f"SUGGESTIONS: {' '.join(allowed_keys)}",
+                    f"Move: {' '.join(allowed_keys)}",
                 ])
 
                 if self.current_goal:
-                    hints_lines.append("")
-                    hints_lines.append(f"Current goal: {self.current_goal}")
-                
+                    hints_lines.append(f"Goal: {self.current_goal}")
+
                 state["hints"] = "\n".join(hints_lines)
                 state["direction_tiles"] = direction_tiles
-                
+
                 # Add map after hints with big header
                 if player_row >= 0:
                     map_result = self._show_map()
                     if map_result.get("status") == "success":
-                        map_header = "\n\n###### MIND MAP ######\n"
+                        map_header = "\n\n###### MAP ######\n"
                         state["hints"] = state["hints"] + map_header + map_result.get("map", "")
 
             # Update state file
