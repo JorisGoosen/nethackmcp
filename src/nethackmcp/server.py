@@ -361,6 +361,22 @@ class NetHackClient:
         # Mark player position as visited
         current_map.mark_visited(player_world_row, player_world_col)
 
+        # Mark cave walls (spaces) adjacent to player as visited
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                adj_row = player_row + dr
+                adj_col = player_col + dc
+                if 0 <= adj_row < len(screen_lines):
+                    line = screen_lines[adj_row]
+                    if 0 <= adj_col < len(line) and line[adj_col] == ' ':
+                        world_row = current_map.dungeon_offset[0] + adj_row
+                        world_col = current_map.dungeon_offset[1] + adj_col
+                        existing = current_map.get_tile(world_row, world_col)
+                        if not existing or (existing.terrain == ' ' and not existing.visited):
+                            current_map.set_tile(world_row, world_col, ' ', seen=True, visited=True)
+
         result["player_world_pos"] = [player_world_row, player_world_col]
         return result
     
