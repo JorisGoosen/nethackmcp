@@ -314,8 +314,9 @@ class NetHackClient:
         # Only store static terrain chars - no spaces, no creatures, no items
         TERRAIN_CHARS = {'#', '.', '+', '-', '|', '<', '>'}
 
-        game_start = 0
-        game_end = 23
+        # Skip first 2 lines (status messages) and last 2 lines (status bar)
+        game_start = 2
+        game_end = len(screen_lines) - 3
 
         # If map is empty, establish initial dungeon_offset from player screen position
         # player_world = dungeon_offset + player_screen, and player_world = (0,0) initially
@@ -353,7 +354,6 @@ class NetHackClient:
             for col, char in enumerate(line):
                 if char not in TERRAIN_CHARS:
                     continue
-                # Convert screen coords to world coords using dungeon offset
                 world_row = current_map.dungeon_offset[0] + row
                 world_col = current_map.dungeon_offset[1] + col
                 current_map.set_tile(world_row, world_col, char, seen=True, visited=True)
@@ -665,9 +665,12 @@ class NetHackClient:
             if new_level is not None and new_level != self.current_level:
                 self.current_level = new_level
             
-            # Update map from screen (only if player was found)
+            # Update map from screen (only if player was found and no --More-- prompt)
             if player_row >= 0 and player_col >= 0:
-                map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
+                if "--More--" not in stripped_text:
+                    map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
+                else:
+                    map_result = {"map_updated": False}
             else:
                 map_result = {"error": "Player position not found on screen"}
             
