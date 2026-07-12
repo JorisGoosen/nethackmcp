@@ -327,19 +327,22 @@ class DungeonMap:
         """
         Find the best dungeon offset by matching static terrain tiles.
         
-        For each possible offset in the search range, calculate world positions
-        of all static terrain on screen and count how many match existing map tiles.
+        Searches around the current dungeon_offset for the best match.
+        
+        For each possible offset, calculate world positions of all static
+        terrain on screen and count how many match existing map tiles.
         Return offset with highest score.
         """
-        best_offset = (0, 0)
+        center_row, center_col = self.dungeon_offset
+        best_offset = self.dungeon_offset
         best_score = -1
         
         TERRAIN_WHITELIST = {'#', '.', '+', '-', '|', '<', '>'}
         
-        # Try all offsets in search range
-        for offset_row in range(-search_range, search_range + 1):
-            for offset_col in range(-search_range, search_range + 1):
-                offset = (offset_row, offset_col)
+        for delta_row in range(-search_range, search_range + 1):
+            for delta_col in range(-search_range, search_range + 1):
+                offset_row = center_row + delta_row
+                offset_col = center_col + delta_col
                 
                 score = 0
                 
@@ -349,24 +352,20 @@ class DungeonMap:
                         if char not in TERRAIN_WHITELIST:
                             continue
                         
-                        # Calculate world position using this offset
-                        world_row = offset[0] + row
-                        world_col = offset[1] + col
+                        world_row = offset_row + row
+                        world_col = offset_col + col
                         
-                        # Check if we have terrain at this world position
                         existing = self.get_tile(world_row, world_col)
                         
                         if existing and existing.terrain == char:
                             score += 1
                         elif existing and existing.terrain in ['.', '#'] and char in ['.', '#']:
-                            # Both are floor types, partial credit
                             score += 0.5
                         elif char in ['.', '#'] and not existing:
-                            # We can add new floor tiles
                             score += 0.1
                 
                 if score > best_score:
                     best_score = score
-                    best_offset = offset
+                    best_offset = (offset_row, offset_col)
         
         return best_offset

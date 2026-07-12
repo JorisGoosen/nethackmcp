@@ -327,6 +327,14 @@ class NetHackClient:
 
         # If map already has tiles, find best dungeon offset by matching static terrain
         else:
+            # If dungeon_offset is (0,0) (fresh from state restore), seed it
+            # from the restored player_world_pos so the search is centered correctly
+            if current_map.dungeon_offset == (0, 0) and current_map.player_world_pos:
+                current_map.dungeon_offset = (
+                    current_map.player_world_pos[0] - player_row,
+                    current_map.player_world_pos[1] - player_col,
+                )
+
             old_offset = current_map.dungeon_offset
             best_offset = current_map.find_best_dungeon_offset(screen_lines, search_range=20)
             current_map.dungeon_offset = best_offset
