@@ -291,11 +291,11 @@ class NetHackClient:
     
     def _update_map_from_screen(self, screen_lines: list[str], player_row: int, player_col: int) -> dict[str, Any]:
         """Update the map using dungeon offset tracking.
-        
-        Finds best dungeon offset by matching static terrain tiles,
-        updates map, and calculates player world position from offset.
-        
-        The dungeon_offset represents where screen position (0,0) is in world coordinates.
+
+        The dungeon_offset is where screen (0,0) sits in world coordinates.
+        It is found by matching static terrain [.|-+#<>] from screen against
+        existing map tiles at world positions.
+
         player_world_pos = dungeon_offset + player_screen_pos
         """
         result = {
@@ -304,66 +304,55 @@ class NetHackClient:
             "player_moved_world": False,
             "screen_shifted": False,
         }
-        
+
         # Get or create map for current level
         if self.current_level not in self.maps:
             self.maps[self.current_level] = DungeonMap(level=self.current_level)
-        
+
         current_map = self.maps[self.current_level]
-        
-        # Extract terrain from screen
+
+        # Only store static terrain chars - no spaces, no creatures, no items
+        TERRAIN_CHARS = {'#', '.', '+', '-', '|', '<', '>'}
+
         game_start = 0
         game_end = 23
-        
+
         # If map is empty, establish initial dungeon_offset from player screen position
         # player_world = dungeon_offset + player_screen, and player_world = (0,0) initially
-        # So dungeon_offset = (0,0) - player_screen = -player_screen
         if not current_map.tiles:
             current_map.dungeon_offset = (-player_row, -player_col)
             current_map.player_world_pos = (0, 0)
             result["screen_shifted"] = True
             result["map_updated"] = True
-        
+
         # If map already has tiles, find best dungeon offset by matching static terrain
         else:
+            old_offset = current_map.dungeon_offset
             best_offset = current_map.find_best_dungeon_offset(screen_lines, search_range=20)
             current_map.dungeon_offset = best_offset
-            result["screen_shifted"] = True
+            if best_offset != old_offset:
+                result["screen_shifted"] = True
             result["map_updated"] = True
-        
+
         # Calculate player world position from dungeon offset + screen position
         player_world_row = current_map.dungeon_offset[0] + player_row
         player_world_col = current_map.dungeon_offset[1] + player_col
         current_map.player_world_pos = (player_world_row, player_world_col)
-        
+
         # Update map with terrain from current screen using dungeon offset
         for row in range(game_start, min(game_end + 1, len(screen_lines))):
             line = screen_lines[row]
             for col, char in enumerate(line):
-                if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
-                    # Convert screen coords to world coords using dungeon offset
-                    world_row = current_map.dungeon_offset[0] + row
-                    world_col = current_map.dungeon_offset[1] + col
-                    existing_tile = current_map.get_tile(world_row, world_col)
-                    if existing_tile and existing_tile.visited:
-                        current_map.mark_visited(world_row, world_col)
-                    else:
-                        current_map.set_tile(world_row, world_col, char, seen=True, visited=True)
-        
+                if char not in TERRAIN_CHARS:
+                    continue
+                # Convert screen coords to world coords using dungeon offset
+                world_row = current_map.dungeon_offset[0] + row
+                world_col = current_map.dungeon_offset[1] + col
+                current_map.set_tile(world_row, world_col, char, seen=True, visited=True)
+
         # Mark player position as visited
         current_map.mark_visited(player_world_row, player_world_col)
-        
-        # Mark adjacent spaces as visited
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                if dr == 0 and dc == 0:
-                    continue
-                adj_world_row = player_world_row + dr
-                adj_world_col = player_world_col + dc
-                tile = current_map.get_tile(adj_world_row, adj_world_col)
-                if tile and tile.terrain == ' ':
-                    current_map.mark_visited(adj_world_row, adj_world_col)
-        
+
         result["player_world_pos"] = [player_world_row, player_world_col]
         return result
     

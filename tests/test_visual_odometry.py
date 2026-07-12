@@ -18,6 +18,7 @@ from nethackmcp.simple_odometry import (
     _find_player_position,
     STATIC_TERRAIN,
 )
+from nethackmcp.map import DungeonMap
 
 
 class TestSimpleOdometryInitialization(unittest.TestCase):
@@ -810,6 +811,208 @@ class TestOdometryAccuracy(unittest.TestCase):
         # World column should be exactly 5 (discrete grid)
         self.assertEqual(col, 5, 
             f"Expected col == 5 after moving right 5 times, got {col}")
+
+
+class TestDungeonOffset(unittest.TestCase):
+    """Tests for find_best_dungeon_offset terrain matching."""
+
+    def _make_screen(self, player_row, player_col, terrain_grid):
+        """Build a screen string from a terrain grid. Replaces 'P' with '@'."""
+        screen = []
+        for r, row_str in enumerate(terrain_grid):
+            line = row_str.replace('P', '@') if r == player_row else row_str
+            screen.append(line)
+        return screen
+
+    def _build_map_from_screen(self, screen, player_row, player_col, dungeon_offset):
+        """Build a DungeonMap with tiles at world positions using the given offset."""
+        game_map = DungeonMap(level=1)
+        game_map.dungeon_offset = dungeon_offset
+        game_map.player_world_pos = (0, 0)
+        TERRAIN_WHITELIST = {'#', '.', '+', '-', '|', '<', '>'}
+
+        for row in range(len(screen)):
+            for col, char in enumerate(screen[row]):
+                if char == '@':
+                    continue
+                if char not in TERRAIN_WHITELIST:
+                    continue
+                world_row = dungeon_offset[0] + row
+                world_col = dungeon_offset[1] + col
+                game_map.set_tile(world_row, world_col, char, seen=True, visited=True)
+
+        return game_map
+
+    def test_same_screen_same_offset(self):
+        """After first frame, find_best_dungeon_offset must return same offset."""
+        screen = [
+            "  -----  ",
+            "  +.P|  ",
+            "  |...  ",
+            "  -----  ",
+        ]
+
+        player_row, player_col = None, None
+        for r, line in enumerate(screen):
+            c = line.find('P')
+            if c >= 0:
+                player_row, player_col = r, c
+                break
+
+        # Replace P with @ for the actual screen
+        for r in range(len(screen)):
+            screen[r] = screen[r].replace('P', '@')
+
+        expected_offset = (-player_row, -player_col)
+
+        game_map = self._build_map_from_screen(screen, player_row, player_col, expected_offset)
+
+        found_offset = game_map.find_best_dungeon_offset(screen, search_range=10)
+
+        self.assertEqual(
+            found_offset, expected_offset,
+            f"find_best_dungeon_offset returned {found_offset}, expected {expected_offset} "
+            f"(player at screen ({player_row}, {player_col}))"
+        )
+
+    def test_same_screen_same_offset_from_screen(self):
+        """Verify from_screen + find_best_dungeon_offset consistency."""
+        screen = [
+            "  -----  ",
+            "  +.@|  ",
+            "  |...  ",
+            "  -----  ",
+        ]
+
+        player_row, player_col = None, None
+        for r, line in enumerate(screen):
+            c = line.find('@')
+            if c >= 0:
+                player_row, player_col = r, c
+                break
+
+        expected_offset = (-player_row, -player_col)
+
+        # Use DungeonMap.from_screen which stores tiles correctly
+        game_map = DungeonMap.from_screen(screen)
+
+        found_offset = game_map.find_best_dungeon_offset(screen, search_range=10)
+
+        self.assertEqual(
+            found_offset, expected_offset,
+            f"from_screen + find_best_dungeon_offset returned {found_offset}, "
+            f"expected {expected_offset} (player at screen ({player_row}, {player_col}))"
+        )
+
+    def test_player_moved_down_one_offset_unchanged(self):
+        """Player moves down by 1 within screen. Dungeon doesn't shift, offset stays same."""
+        screen1 = [
+            "  -----  ",
+            "  +.@|  ",
+            "  |...  ",
+            "  -----  ",
+        ]
+
+        screen2 = [
+            "  -----  ",
+            "  +..|  ",
+            "  |.@.  ",
+            "  -----  ",
+        ]
+
+        p1_row, p1_col = 1, 4
+        p2_row, p2_col = 2, 4
+
+        offset1 = (-p1_row, -p1_col)  # (-1, -4)
+
+        game_map = self._build_map_from_screen(screen1, p1_row, p1_col, offset1)
+
+        found_offset2 = game_map.find_best_dungeon_offset(screen2, search_range=10)
+
+        # When player moves within screen, dungeon DOESN'T shift.
+        # Offset stays the same. Only player world position changes.
+        self.assertEqual(
+            found_offset2, offset1,
+            f"After moving down within screen: got {found_offset2}, expected {offset1} "
+            f"(dungeon didn't move, only player moved within it)"
+        )
+
+        # Player world position should update: world = offset + screen_pos
+        player_world_row = found_offset2[0] + p2_row
+        player_world_col = found_offset2[1] + p2_col
+        self.assertEqual(
+            (player_world_row, player_world_col), (1, 0),
+            f"Player world position wrong: {(player_world_row, player_world_col)}"
+        )
+
+    def test_viewport_scrolled_down_player_moved_down(self):
+        """Screen 1 -> Screen 2: dungeon scrolled DOWN, player moved DOWN."""
+        # Screen 1: 4 rows, player at (1,2)
+        screen1 = [
+            "-----",
+            "|.@.|",
+            "|...|",
+            "--.--",
+        ]
+        # Screen 2: 5 rows (first empty), dungeon shifted down, player at (3,2)
+        screen2 = [
+            "",
+            "-----",
+            "|...|",
+            "|.@.|",
+            "--.--",
+        ]
+
+        p1_row, p1_col = 1, 2
+        p2_row, p2_col = 3, 2
+
+        offset1 = (-p1_row, -p1_col)  # (-1, -2)
+        game_map = self._build_map_from_screen(screen1, p1_row, p1_col, offset1)
+
+        found_offset2 = game_map.find_best_dungeon_offset(screen2, search_range=10)
+        expected_offset2 = (-2, -2)  # dungeon scrolled down by 1
+
+        self.assertEqual(found_offset2, expected_offset2,
+                         f"Scroll down: got {found_offset2}, expected {expected_offset2}")
+
+        player_world_row = found_offset2[0] + p2_row
+        player_world_col = found_offset2[1] + p2_col
+        self.assertEqual((player_world_row, player_world_col), (1, 0),
+                         f"Player world: ({player_world_row}, {player_world_col}), expected (1, 0)")
+
+    def test_viewport_scrolled_right_player_moved_left(self):
+        """Screen 2 -> Screen 3: dungeon scrolled RIGHT, player moved LEFT."""
+        screen2 = [
+            "",
+            "-----",
+            "|...|",
+            "|.@.|",
+            "--.--",
+        ]
+        screen3 = [
+            " ",
+            " -----",
+            " |...|",
+            " |@..|",
+            " --.--",
+        ]
+
+        p2_row, p2_col = 3, 2
+        p3_row, p3_col = 3, 2
+
+        offset2 = (-2, -2)  # from previous frame
+        game_map = self._build_map_from_screen(screen2, p2_row, p2_col, offset2)
+
+        found_offset3 = game_map.find_best_dungeon_offset(screen3, search_range=10)
+        expected_offset3 = (-2, -3)  # dungeon scrolled right by 1
+
+        self.assertEqual(found_offset3, expected_offset3,
+                         f"Scroll right: got {found_offset3}, expected {expected_offset3}")
+
+        player_world_row = found_offset3[0] + p3_row
+        player_world_col = found_offset3[1] + p3_col
+        self.assertEqual((player_world_row, player_world_col), (1, -1),
+                         f"Player world: ({player_world_row}, {player_world_col}), expected (1, -1)")
 
 
 if __name__ == '__main__':

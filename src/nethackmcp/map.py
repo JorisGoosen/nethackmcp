@@ -176,7 +176,6 @@ class DungeonMap:
         return {
             "level": self.level,
             "player_world_pos": self.player_world_pos,
-            "dungeon_offset": self.dungeon_offset,
             "bounds": bounds,
             "downstairs_pos": self.downstairs_pos,
             "tiles": {
@@ -189,7 +188,6 @@ class DungeonMap:
     def from_dict(cls, data: dict[str, Any]) -> "DungeonMap":
         map_obj = cls(level=data["level"])
         map_obj.player_world_pos = tuple(data["player_world_pos"]) if data["player_world_pos"] else None
-        map_obj.dungeon_offset = tuple(data["dungeon_offset"]) if data["dungeon_offset"] else (0, 0)
         bounds_data = data["bounds"]
         map_obj.bounds = {
             "min_row": bounds_data.get("min_row", bounds_data.get("min_x")),
