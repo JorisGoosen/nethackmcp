@@ -290,7 +290,14 @@ class NetHackClient:
         return best_match
     
     def _update_map_from_screen(self, screen_lines: list[str], player_row: int, player_col: int) -> dict[str, Any]:
-        """Update the map based on current screen. Returns movement analysis result."""
+        """Update the map using dungeon offset tracking.
+        
+        Finds best dungeon offset by matching static terrain tiles,
+        updates map, and calculates player world position from offset.
+        
+        The dungeon_offset represents where screen position (0,0) is in world coordinates.
+        player_world_pos = dungeon_offset + player_screen_pos
+        """
         result = {
             "player_world_pos": None,
             "map_updated": False,
@@ -304,130 +311,49 @@ class NetHackClient:
         
         current_map = self.maps[self.current_level]
         
-        # Extract terrain from screen (filter out status bars)
-        # Changed from 6/15 to 0/23 to capture all terrain including stairs
+        # Extract terrain from screen
         game_start = 0
         game_end = 23
         
-        # Store current player screen position for next comparison
-        current_player_screen_pos = (player_row, player_col)
+        # If map is empty, establish initial dungeon_offset from player screen position
+        # player_world = dungeon_offset + player_screen, and player_world = (0,0) initially
+        # So dungeon_offset = (0,0) - player_screen = -player_screen
+        if not current_map.tiles:
+            current_map.dungeon_offset = (-player_row, -player_col)
+            current_map.player_world_pos = (0, 0)
+            result["screen_shifted"] = True
+            result["map_updated"] = True
         
-        if self._player_chunks_4x4 is None:
-            # First frame - player starts at world origin (0, 0)
-            current_map.set_player_position(0, 0, '.')
-            self._player_chunks_4x4 = current_player_screen_pos
-            self._previous_player_world_pos = (0, 0)
-            self._previous_player_screen_pos = current_player_screen_pos
-            
-            # Store actual terrain at player position
-            if player_row >= 0 and player_row < len(screen_lines):
-                line = screen_lines[player_row]
-                if player_col >= 0 and player_col < len(line):
-                    terrain = line[player_col]
-                    if terrain != '@':
-                        current_map.set_tile(0, 0, terrain)
-            
-            result["player_world_pos"] = [0, 0]
+        # If map already has tiles, find best dungeon offset by matching static terrain
         else:
-            # Extract 4x4 terrain chunks from multiple positions to detect movement
-            offsets_to_check = [
-                (0, 0), (-2, 0), (2, 0), (0, -2), (0, 2),
-                (-2, -2), (-2, 2), (2, -2), (2, 2)
-            ]
-            
-            # Build map of previous chunks by their screen position
-            prev_chunks_by_pos = {}
-            for prev_row_offset, prev_col_offset in offsets_to_check:
-                prev_row = player_row + prev_row_offset
-                prev_col = player_col + prev_col_offset
-                chunk = self._get_terrain_chunk(
-                    self.previous_stripped_screen or [], 
-                    prev_row, 
-                    prev_col, 
-                    size=4
-                )
-                prev_chunks_by_pos[(prev_row, prev_col)] = chunk
-            
-            # Try to find matching chunk at current position
-            best_match_pos = None
-            best_score = -1
-            
-            current_chunk = self._get_terrain_chunk(screen_lines, player_row, player_col, size=4)
-            
-            for (prev_row, prev_col), prev_chunk in prev_chunks_by_pos.items():
-                if len(prev_chunk) != 4 or len(prev_chunk[0]) != 4:
-                    continue
-                
-                score = 0
-                for r in range(4):
-                    for c in range(4):
-                        if prev_chunk[r][c] == current_chunk[r][c] and prev_chunk[r][c] not in ' @':
-                            score += 1
-                
-                if score > best_score:
-                    best_score = score
-                    best_match_pos = (prev_row, prev_col)
-            
-            # Check for screen shift vs player movement
-            if best_match_pos and best_match_pos != (player_row, player_col):
-                # Screen has shifted - terrain moved relative to screen
-                # Calculate the shift: how much did the screen move?
-                screen_shift_row = player_row - best_match_pos[0]
-                screen_shift_col = player_col - best_match_pos[1]
-                
-                # Update player world position based on screen shift
-                if current_map.player_world_pos:
-                    current_map.player_world_pos = (
-                        current_map.player_world_pos[0] + screen_shift_row,
-                        current_map.player_world_pos[1] + screen_shift_col
-                    )
-                result["screen_shifted"] = True
-                result["player_moved_world"] = True
-                result["map_updated"] = True
-            else:
-                # Screen hasn't shifted significantly, check if player moved
-                # by comparing player screen position with previous frame
-                if hasattr(self, '_previous_player_screen_pos'):
-                    prev_row, prev_col = self._previous_player_screen_pos
-                    screen_row_delta = player_row - prev_row
-                    screen_col_delta = player_col - prev_col
-                    
-                    if screen_row_delta != 0 or screen_col_delta != 0:
-                        # Player moved relative to screen - update absolute world position
-                        if current_map.player_world_pos:
-                            current_map.player_world_pos = (
-                                current_map.player_world_pos[0] + screen_row_delta,
-                                current_map.player_world_pos[1] + screen_col_delta
-                            )
-                        result["player_moved_world"] = True
-                        result["map_updated"] = True
-            
-            self._previous_player_screen_pos = current_player_screen_pos
+            best_offset = current_map.find_best_dungeon_offset(screen_lines, search_range=20)
+            current_map.dungeon_offset = best_offset
+            result["screen_shifted"] = True
+            result["map_updated"] = True
         
-        player_world_row, player_world_col = current_map.player_world_pos or (0, 0)
+        # Calculate player world position from dungeon offset + screen position
+        player_world_row = current_map.dungeon_offset[0] + player_row
+        player_world_col = current_map.dungeon_offset[1] + player_col
+        current_map.player_world_pos = (player_world_row, player_world_col)
         
-        # Update map with terrain from current screen
+        # Update map with terrain from current screen using dungeon offset
         for row in range(game_start, min(game_end + 1, len(screen_lines))):
             line = screen_lines[row]
             for col, char in enumerate(line):
                 if char in DungeonMap.PASSABLE_TERRAIN or char in DungeonMap.IMPASSABLE_TERRAIN:
-                    # Convert screen coords to world coords
-                    # Player is at screen (player_row, player_col) and world (player_world_row, player_world_col)
-                    # Tile at screen (row, col) has world coords:
-                    # world_row = (row - player_row) + player_world_row
-                    # world_col = (col - player_col) + player_world_col
-                    world_row = (row - player_row) + player_world_row
-                    world_col = (col - player_col) + player_world_col
-                    # Check if tile already exists and is visited - if so, preserve terrain (especially ' ' -> 'X')
+                    # Convert screen coords to world coords using dungeon offset
+                    world_row = current_map.dungeon_offset[0] + row
+                    world_col = current_map.dungeon_offset[1] + col
                     existing_tile = current_map.get_tile(world_row, world_col)
                     if existing_tile and existing_tile.visited:
                         current_map.mark_visited(world_row, world_col)
                     else:
-                        current_map.set_tile(world_row, world_col, char, seen=True)
+                        current_map.set_tile(world_row, world_col, char, seen=True, visited=True)
         
+        # Mark player position as visited
         current_map.mark_visited(player_world_row, player_world_col)
         
-        # Mark adjacent spaces as visited (so they show as X in map)
+        # Mark adjacent spaces as visited
         for dr in [-1, 0, 1]:
             for dc in [-1, 0, 1]:
                 if dr == 0 and dc == 0:
@@ -438,8 +364,7 @@ class NetHackClient:
                 if tile and tile.terrain == ' ':
                     current_map.mark_visited(adj_world_row, adj_world_col)
         
-        result["player_world_pos"] = [player_world_row, player_world_col] if current_map.player_world_pos else [0, 0]
-        result["map_updated"] = result["map_updated"] or result["player_moved_world"]
+        result["player_world_pos"] = [player_world_row, player_world_col]
         return result
     
     def _update_map_from_screen_odom(
@@ -743,24 +668,9 @@ class NetHackClient:
             if new_level is not None and new_level != self.current_level:
                 self.current_level = new_level
             
-            # Initialize visual odometry if needed
-            if self._simple_odom is None and player_row >= 0 and player_col >= 0:
-                self._simple_odom = SimpleOdometry()
-            
             # Update map from screen (only if player was found)
             if player_row >= 0 and player_col >= 0:
-                # Use visual odometry for positioning if available
-                if self._simple_odom is not None:
-                    world_row, world_col, odom_confidence = self._simple_odom.update(
-                        screen_lines, player_row, player_col
-                    )
-                    
-                    map_result = self._update_map_from_screen_odom(
-                        screen_lines, player_row, player_col, world_row, world_col
-                    )
-                    map_result["odometry_confidence"] = odom_confidence
-                else:
-                    map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
+                map_result = self._update_map_from_screen(screen_lines, player_row, player_col)
             else:
                 map_result = {"error": "Player position not found on screen"}
             
@@ -779,7 +689,7 @@ class NetHackClient:
                     "explored_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_explored_count(),
                     "seen_tiles": self.maps.get(self.current_level, DungeonMap(self.current_level)).get_seen_count(),
                     "bounds": self.maps.get(self.current_level, DungeonMap(self.current_level)).bounds,
-                    "odometry_confidence": map_result.get("odometry_confidence"),
+                    
                 } if self.maps else {
                     "level": self.current_level,
                     "player_world_pos": None,
@@ -843,10 +753,9 @@ class NetHackClient:
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
                         
-                        # Convert screen position to world coordinates
-                        # World = (screen_offset_from_player) + player_world_pos
-                        world_row = (direction_row - player_row) + current_map.player_world_pos[0]
-                        world_col = (direction_col - player_col) + current_map.player_world_pos[1]
+                        # Convert screen position to world coordinates using dungeon_offset
+                        world_row = current_map.dungeon_offset[0] + direction_row
+                        world_col = current_map.dungeon_offset[1] + direction_col
                         tile_obj = current_map.get_tile(world_row, world_col)
                         if tile_obj:
                             visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
@@ -866,9 +775,9 @@ class NetHackClient:
                         row_offset, col_offset = self._get_direction_offset(key)
                         direction_row = player_row + row_offset
                         direction_col = player_col + col_offset
-                        # Convert screen coordinates to world coordinates
-                        world_row = (direction_row - player_row) + current_map.player_world_pos[0]
-                        world_col = (direction_col - player_col) + current_map.player_world_pos[1]
+                        # Convert screen coordinates to world coordinates using dungeon_offset
+                        world_row = current_map.dungeon_offset[0] + direction_row
+                        world_col = current_map.dungeon_offset[1] + direction_col
                         is_passable = current_map._is_terrain_passable(world_row, world_col)
                         # Debug: print(f"DIR {key}: tile='{tile}' world=({world_row},{world_col}) passable={is_passable}")
                         if is_passable:
@@ -918,8 +827,6 @@ class NetHackClient:
                     state["player_chunks_4x4"] = self._player_chunks_4x4
                     if self._previous_player_screen_pos:
                         state["previous_player_screen_pos"] = list(self._previous_player_screen_pos)
-                    if self._previous_player_world_pos:
-                        state["previous_player_world_pos"] = list(self._previous_player_world_pos)
                     
                     # Save visual odometry state
                     if self._simple_odom is not None:
