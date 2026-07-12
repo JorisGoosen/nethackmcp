@@ -78,7 +78,7 @@ class NetHackClient:
     def __init__(self):
         self.session_name: str | None = None
         self.state_file: str | None = None
-        self.current_goal: str = "Explore ?"
+        self.current_goal: str = "Explore questionmarks"
         self.goal_counter: int = 0
         self.goal_locked_until_counter: int = -1
         self.game_state: dict[str, Any] = {}
@@ -947,7 +947,7 @@ class NetHackClient:
 
         self.session_name = None
         self.state_file = None
-        self.current_goal = "Explore"
+        self.current_goal = "Explore questionmarks"
         self.goal_counter = 0
         self.goal_locked_until_counter = -1
         self.current_level = 1
