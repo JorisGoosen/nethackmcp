@@ -929,9 +929,74 @@ async def run() -> None:
         )
 
 
+async def run_sse(port: int = 8000, host: str = "0.0.0.0") -> None:
+    """Start the MCP server over SSE/HTTP so you can watch the game."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    import uvicorn
+
+    sse = mcp.server.sse.SseServerTransport("/messages/")
+
+    async def handle_sse(request):
+        async with sse.connect_sse(
+            request.scope, request.receive, request._send
+        ) as (read_stream, write_stream):
+            caps = server.get_capabilities(
+                notification_options=NotificationOptions(),
+                experimental_capabilities={},
+            )
+            caps.tools = types.ToolsCapability(listChanged=True)
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="nethack-mcp",
+                    server_version="0.1.0",
+                    capabilities=caps,
+                    instructions=SERVER_INSTRUCTIONS,
+                ),
+            )
+
+    starlette_app = Starlette(
+        routes=[
+            Route("/sse", endpoint=handle_sse),
+            Route("/messages/", endpoint=sse.handle_post_message, methods=["POST"]),
+        ],
+    )
+
+    print(f"NetHack MCP server listening on http://{host}:{port}/sse", flush=True)
+    config = uvicorn.Config(starlette_app, host=host, port=port, log_level="info")
+    server_uv = uvicorn.Server(config)
+    await server_uv.serve()
+
+
 def main() -> None:
-    """CLI entry point."""
-    asyncio.run(run())
+    """CLI entry point — defaults to stdio transport."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="NetHack MCP server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="Transport mode (default: stdio)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000, help="Port for SSE mode (default: 8000)"
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Host for SSE mode (default: 0.0.0.0)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        print(f"Starting NetHack MCP server in SSE mode on {args.host}:{args.port}", flush=True)
+        asyncio.run(run_sse(port=args.port, host=args.host))
+    else:
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
