@@ -38,7 +38,6 @@ class DungeonMap:
     # Terrain mappings
     PASSABLE_TERRAIN = {'#', '.', '+', '>'}
     IMPASSABLE_TERRAIN = {'|', '-', ' ', '<'}
-    STATIC_TERRAIN = {'#', '.', '+', '-', '|', '<', '>'}  # Used for offset detection
     
     def __init__(self, level: int = 1):
         self.level = level
@@ -190,10 +189,10 @@ class DungeonMap:
         map_obj.player_world_pos = tuple(data["player_world_pos"]) if data["player_world_pos"] else None
         bounds_data = data["bounds"]
         map_obj.bounds = {
-            "min_row": bounds_data.get("min_row", bounds_data.get("min_x")),
-            "max_row": bounds_data.get("max_row", bounds_data.get("max_x")),
-            "min_col": bounds_data.get("min_col", bounds_data.get("min_y")),
-            "max_col": bounds_data.get("max_col", bounds_data.get("max_y")),
+            "min_row": bounds_data.get("min_row"),
+            "max_row": bounds_data.get("max_row"),
+            "min_col": bounds_data.get("min_col"),
+            "max_col": bounds_data.get("max_col"),
         }
         map_obj.downstairs_pos = tuple(data["downstairs_pos"]) if data.get("downstairs_pos") else None
         

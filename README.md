@@ -1,22 +1,24 @@
 # NetHack MCP Server
 
-MCP server voor het spelen van NetHack via AI-interactie.
+MCP server for playing NetHack via AI interaction.
 
-## Installatie
+## Installation
 
 ```bash
 uv sync
 ```
 
-## Gebruik
+## Usage
 
 ```bash
-uv run python src/nethackmcp.py
+uv run python run_server.py
 ```
 
-## Capabilities
+## Tools
 
-- `nethack_start` - Start een nieuw spel
-- `nethack_move` - Stuur moves/commands
-- `nethack_state` - krijg game state
-- `nethack_stop` - Stop spel
+- `nethack_start` - Start a new game
+- `nethack_move` - Send moves/commands
+- `nethack_state` - Get game state
+- `nethack_stop` - Stop game
+- `nethack_set_goal` - Set AI player goal
+- `nethack_diff` - View screen changes since last move

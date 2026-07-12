@@ -14,7 +14,6 @@ dist/
 *.egg
 
 # uv
-uv.lock
 *.log
 
 # IDE
