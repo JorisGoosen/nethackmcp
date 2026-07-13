@@ -707,6 +707,28 @@ class NetHackClient:
 # ------------------------------------------------------------------ #
 
 server = Server("nethack-mcp")
+_fullscreen = False
+
+
+def _show_fullscreen(screen: str, hints: str) -> None:
+    """Clear terminal and print screen + map."""
+    map_start = hints.find("###### MAP ######")
+    if map_start != -1:
+        map_part = hints[map_start + len("###### MAP ######"):].strip()
+        hints_part = hints[:map_start].strip()
+    else:
+        map_part = hints[hints.rfind("\n"):].strip() if hints else ""
+        hints_part = hints
+
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.write(screen)
+    if hints_part:
+        sys.stdout.write(f"\n{hints_part}\n")
+    if map_part:
+        sys.stdout.write(f"\n{map_part}\n")
+    sys.stdout.flush()
+
+_fullscreenclear: asyncio.Event | None = None
 
 
 @server.list_tools()
@@ -817,6 +839,10 @@ async def handle_call_tool(
             screen_output = result.get("screen", "")
             hints = result.get("hints", "")
             diff = result.get("diff", "")
+
+            if _fullscreen:
+                _show_fullscreen(screen_output, hints)
+
             output = screen_output if screen_output else json.dumps(result, indent=2)
             if hints:
                 output = output + "\n" + hints
@@ -929,11 +955,14 @@ async def run() -> None:
         )
 
 
-async def run_sse(port: int = 8000, host: str = "0.0.0.0") -> None:
+async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = False) -> None:
     """Start the MCP server over SSE/HTTP so you can watch the game."""
     from starlette.responses import PlainTextResponse
 
     import uvicorn
+
+    global _fullscreen
+    _fullscreen = fullscreen
 
     sse = mcp.server.sse.SseServerTransport("/messages/")
 
@@ -992,11 +1021,16 @@ def main() -> None:
         default="0.0.0.0",
         help="Host for SSE mode (default: 0.0.0.0)",
     )
+    parser.add_argument(
+        "--fullscreen",
+        action="store_true",
+        help="Watch mode: print screen + map to terminal",
+    )
     args = parser.parse_args()
 
     if args.transport == "sse":
         print(f"Starting NetHack MCP server in SSE mode on {args.host}:{args.port}", flush=True)
-        asyncio.run(run_sse(port=args.port, host=args.host))
+        asyncio.run(run_sse(port=args.port, host=args.host, fullscreen=args.fullscreen))
     else:
         asyncio.run(run())
 
