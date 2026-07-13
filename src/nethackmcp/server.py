@@ -685,7 +685,14 @@ class NetHackClient:
             if current_map:
                 map_result = self._show_map()
                 if map_result.get("status") == "success":
-                    state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_result.get("map", "")
+                    map_str = map_result.get("map", "")
+                    pw_row, pw_col = current_map.player_world_pos
+                    player_tile = current_map.get_tile(pw_row, pw_col)
+                    if player_tile:
+                        terrain_char = player_tile.terrain
+                    else:
+                        terrain_char = "unknown"
+                    state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_str + "\n\nPlayer is STANDING ON TOP OFF: " + terrain_char
 
         self._persist_state(state)
         self.game_state = state

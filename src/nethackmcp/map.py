@@ -222,7 +222,7 @@ class DungeonMap:
             min_col = min(min_col, min(c for r, c in visited_tiles) - padding)
             max_col = max(max_col, max(c for r, c in visited_tiles) + padding)
         
-        map_lines = []
+        map_lines = [""]
         for row in range(min_row, max_row + 1):
             line = ""
             for col in range(min_col, max_col + 1):
@@ -254,7 +254,7 @@ class DungeonMap:
             
             map_lines.append(line)
         
-        return "\n".join(map_lines)
+        return "\n".join(map_lines) + "\n"
     
     @classmethod
     def from_screen(cls, screen_lines: list[str], game_start: int = 6, game_end: int = 15) -> "DungeonMap":
