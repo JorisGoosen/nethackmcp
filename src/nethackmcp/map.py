@@ -37,7 +37,7 @@ class DungeonMap:
     
     # Terrain mappings
     PASSABLE_TERRAIN = {'#', '.', '+', '>'}
-    IMPASSABLE_TERRAIN = {'|', '-', ' ', '<'}
+    IMPASSABLE_TERRAIN = {'|', '-', ' '}
     
     def __init__(self, level: int = 1):
         self.level = level
@@ -298,7 +298,8 @@ class DungeonMap:
                 # Player is at screen (player_row, player_col) and world (0, 0)
                 world_row = row - player_row
                 world_col = col - player_col
-                map_obj.set_tile(world_row, world_col, char, seen=True)
+                tile_char = '.' if char == '<' else char
+                map_obj.set_tile(world_row, world_col, tile_char, seen=True)
         
         # Set player position at world origin (0, 0)
         map_obj.player_world_pos = (0, 0)
@@ -359,7 +360,8 @@ class DungeonMap:
                         
                         existing = self.get_tile(world_row, world_col)
                         
-                        if existing and existing.terrain == char:
+                        match_char = '.' if char == '<' else char
+                        if existing and existing.terrain == match_char:
                             score += 1
                         elif existing and existing.terrain in ['.', '#'] and char in ['.', '#']:
                             score += 0.5

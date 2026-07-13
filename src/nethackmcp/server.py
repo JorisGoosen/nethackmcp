@@ -50,7 +50,7 @@ You are connected to NetHack through this MCP server.
 - `@` you
 - `.` floor | `#` cavefloor | `+` door (all passable)
 - `>` stairs down (passable)
-- `| -` walls | ` ` rockwall | `<` stairs up (all impassable)
+- `| -` walls | ` ` rockwall (all impassable)
 - `X` visited rockwall | `?` unexplored adjacent
 
 ## Important:
@@ -309,9 +309,10 @@ class NetHackClient:
             for col, char in enumerate(line):
                 if char not in TERRAIN_CHARS:
                     continue
+                tile_char = '.' if char == '<' else char
                 world_row = current_map.dungeon_offset[0] + row
                 world_col = current_map.dungeon_offset[1] + col
-                current_map.set_tile(world_row, world_col, char, seen=True)
+                current_map.set_tile(world_row, world_col, tile_char, seen=True)
 
         current_map.mark_visited(player_world_row, player_world_col)
 
@@ -329,6 +330,16 @@ class NetHackClient:
                         existing = current_map.get_tile(world_row, world_col)
                         if not existing or (existing.terrain == " " and not existing.visited):
                             current_map.set_tile(world_row, world_col, " ", seen=True, visited=True)
+
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                world_row = player_world_row + dr
+                world_col = player_world_col + dc
+                existing = current_map.get_tile(world_row, world_col)
+                if existing and existing.terrain == ' ':
+                    current_map.mark_visited(world_row, world_col)
 
         result["player_world_pos"] = [player_world_row, player_world_col]
         return result
