@@ -50,7 +50,7 @@ You are connected to NetHack through this MCP server.
 - `@` you
 - `.` floor | `#` cavefloor | `+` door (all passable)
 - `>` stairs down (passable)
-- `| -` walls | ` ` rockwall (all impassable)
+- `| -` walls | ` ` rockwall | `<` stairs up (all impassable)
 - `X` visited rockwall | `?` unexplored adjacent
 
 ## Important:
@@ -309,7 +309,7 @@ class NetHackClient:
             for col, char in enumerate(line):
                 if char not in TERRAIN_CHARS:
                     continue
-                tile_char = '.' if char == '<' else char
+                tile_char = char
                 world_row = current_map.dungeon_offset[0] + row
                 world_col = current_map.dungeon_offset[1] + col
                 current_map.set_tile(world_row, world_col, tile_char, seen=True)
@@ -340,6 +340,17 @@ class NetHackClient:
                 existing = current_map.get_tile(world_row, world_col)
                 if existing and existing.terrain == ' ':
                     current_map.mark_visited(world_row, world_col)
+
+        bounds = current_map.bounds
+        if bounds["min_row"] is not None:
+            for col in range(bounds["min_col"] - 1, bounds["max_col"] + 2):
+                for row_offset in (bounds["min_row"] - 1, bounds["max_row"] + 1):
+                    if not current_map.get_tile(row_offset, col):
+                        current_map.set_tile(row_offset, col, " ", seen=False, visited=False)
+            for row in range(bounds["min_row"], bounds["max_row"] + 1):
+                for col_offset in (bounds["min_col"] - 1, bounds["max_col"] + 1):
+                    if not current_map.get_tile(row, col_offset):
+                        current_map.set_tile(row, col_offset, " ", seen=False, visited=False)
 
         result["player_world_pos"] = [player_world_row, player_world_col]
         return result
@@ -590,6 +601,9 @@ class NetHackClient:
                         world_row, world_col
                     ):
                         tile = "+"
+                    if tile == " " and tile_obj.visited:
+                        tile = "X"
+                        map_info = " IMPASSABLE"
             hints_lines.append(f"`{key}`:{tile}{map_info}")
 
         
@@ -693,6 +707,9 @@ class NetHackClient:
                     else:
                         terrain_char = "unknown"
                     state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_str + "\n\nPlayer is STANDING ON TOP OFF: " + terrain_char
+
+        if "--More--" in raw_text:
+            state["screen"] = state["screen"] + '\nSend literal string "Enter" to continue beyond --More--'
 
         self._persist_state(state)
         self.game_state = state

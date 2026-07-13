@@ -37,7 +37,7 @@ class DungeonMap:
     
     # Terrain mappings
     PASSABLE_TERRAIN = {'#', '.', '+', '>'}
-    IMPASSABLE_TERRAIN = {'|', '-', ' '}
+    IMPASSABLE_TERRAIN = {'|', '-', ' ', '<'}
     
     def __init__(self, level: int = 1):
         self.level = level
@@ -125,7 +125,9 @@ class DungeonMap:
                 seen=seen,
                 passable=passable,
             )
-        self._update_bounds(row, col)
+        tile = self.tiles[(row, col)]
+        if not (terrain == ' ' and not tile.visited):
+            self._update_bounds(row, col)
     
     def mark_visited(self, row: int, col: int):
         if not isinstance(row, int) or not isinstance(col, int):
@@ -137,6 +139,7 @@ class DungeonMap:
             tile.seen = True
             if tile.terrain == ' ':
                 tile.terrain = 'X'
+            self._update_bounds(row, col)
         else:
             self.tiles[(row, col)] = Tile(terrain='.', visited=True, seen=True, passable=True)
     
@@ -298,7 +301,7 @@ class DungeonMap:
                 # Player is at screen (player_row, player_col) and world (0, 0)
                 world_row = row - player_row
                 world_col = col - player_col
-                tile_char = '.' if char == '<' else char
+                tile_char = char
                 map_obj.set_tile(world_row, world_col, tile_char, seen=True)
         
         # Set player position at world origin (0, 0)
@@ -360,8 +363,7 @@ class DungeonMap:
                         
                         existing = self.get_tile(world_row, world_col)
                         
-                        match_char = '.' if char == '<' else char
-                        if existing and existing.terrain == match_char:
+                        if existing and existing.terrain == char:
                             score += 1
                         elif existing and existing.terrain in ['.', '#'] and char in ['.', '#']:
                             score += 0.5
