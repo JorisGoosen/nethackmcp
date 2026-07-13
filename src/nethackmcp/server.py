@@ -233,6 +233,14 @@ class NetHackClient:
             self.state_file = f"{self.STATE_FILE_PREFIX}{suffix}.json"
         return self.state_file
 
+    def _is_new_game_screen(self, raw_text: str) -> bool:
+        """Check if the screen shows a new game / character selection screen."""
+        new_game_markers = [
+            "Who are you?",
+            "Do you want your possessions identified?",
+        ]
+        return any(marker in raw_text for marker in new_game_markers)
+
     def _extract_level_from_status(self, screen_lines: list[str]) -> int | None:
         """Extract current dungeon level from status bar."""
         for line in screen_lines:
@@ -617,6 +625,10 @@ class NetHackClient:
             return {"error": str(e), "status": "error"}
         except subprocess.CalledProcessError as e:
             return {"error": f"Failed to capture screen: {e}", "status": "error"}
+
+        if self._is_new_game_screen(raw_text):
+            self.maps = {}
+            self.current_level = 1
 
         player_pos = self._find_player(screen_lines)
 
