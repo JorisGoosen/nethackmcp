@@ -99,7 +99,7 @@ class TestScreenToMap(unittest.TestCase):
         self.assertIsNotNone(map_obj.bounds["max_col"])
 
     def test_from_screen_adjacent_tiles_visited(self):
-        """Test that tiles adjacent to player are marked as visited."""
+        """Test that passable tiles are only visited when player is ON them, walls when adjacent."""
         screen = [
             "-----------",
             "|..........",
@@ -109,14 +109,29 @@ class TestScreenToMap(unittest.TestCase):
         
         map_obj = DungeonMap.from_screen(screen)
         
-        # All visible tiles should be visited (for map display)
-        # Check a few tiles around player
+        # Player's current tile (0,0) should be visited
+        player_tile = map_obj.get_tile(0, 0)
+        self.assertIsNotNone(player_tile)
+        self.assertTrue(player_tile.visited, "Player tile (0,0) should be visited")
+        
+        # Adjacent passable tiles should be seen but NOT visited
         for dx in [-1, 0, 1]:
             for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
                 tile = map_obj.get_tile(dx, dy)
-                if tile is not None and tile.terrain != '$':
-                    # Non-gold tiles should be visited
-                    self.assertTrue(tile.visited, f"Tile at ({dx}, {dy}) should be visited")
+                if tile is not None and tile.terrain not in ('$', ' '):
+                    self.assertFalse(tile.visited, f"Passable tile at ({dx}, {dy}) should NOT be visited")
+                    self.assertTrue(tile.seen, f"Passable tile at ({dx}, {dy}) should be seen")
+        
+        # Adjacent wall tiles should be visited
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                tile = map_obj.get_tile(dx, dy)
+                if tile is not None and tile.terrain == ' ':
+                    self.assertTrue(tile.visited, f"Wall tile at ({dx}, {dy}) should be visited")
 
     def test_map_generation_from_screen(self):
         """Test that map string can be generated from screen input."""

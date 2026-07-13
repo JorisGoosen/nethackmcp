@@ -303,7 +303,7 @@ class NetHackClient:
                     continue
                 world_row = current_map.dungeon_offset[0] + row
                 world_col = current_map.dungeon_offset[1] + col
-                current_map.set_tile(world_row, world_col, char, seen=True, visited=True)
+                current_map.set_tile(world_row, world_col, char, seen=True)
 
         current_map.mark_visited(player_world_row, player_world_col)
 
@@ -573,21 +573,7 @@ class NetHackClient:
                         tile = "+"
             hints_lines.append(f"`{key}`:{tile}{map_info}")
 
-        blocked_tiles = {" ", "<"}
-        allowed_keys = []
-        for key, tile in direction_tiles.items():
-            if current_map and current_map.player_world_pos:
-                row_offset, col_offset = _DIRECTION_OFFSETS.get(key, (0, 0))
-                direction_row = player_row + row_offset
-                direction_col = player_col + col_offset
-                world_row = current_map.dungeon_offset[0] + direction_row
-                world_col = current_map.dungeon_offset[1] + direction_col
-                if current_map._is_terrain_passable(world_row, world_col):
-                    allowed_keys.append(key)
-            elif tile not in blocked_tiles and tile != "-":
-                allowed_keys.append(key)
-
-        hints_lines.extend(["", f"Move: {' '.join(allowed_keys)}"])
+        
         if self.current_goal:
             hints_lines.append(f"Goal: {self.current_goal}")
 

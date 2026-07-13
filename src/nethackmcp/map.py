@@ -242,7 +242,14 @@ class DungeonMap:
                     terrain = 'X'
                 elif terrain == ' ' and self._is_adjacent_to_passable(row, col):
                     terrain = '?'
-                
+
+                if self.player_world_pos and (row, col) == self.player_world_pos:
+                    cell_tile = self.get_tile(row, col)
+                    if cell_tile and cell_tile.terrain == '>':
+                        terrain = '!'
+                    else:
+                        terrain = '@'
+
                 line += terrain
             
             map_lines.append(line)
@@ -291,7 +298,7 @@ class DungeonMap:
                 # Player is at screen (player_row, player_col) and world (0, 0)
                 world_row = row - player_row
                 world_col = col - player_col
-                map_obj.set_tile(world_row, world_col, char, seen=True, visited=True)
+                map_obj.set_tile(world_row, world_col, char, seen=True)
         
         # Set player position at world origin (0, 0)
         map_obj.player_world_pos = (0, 0)
@@ -310,11 +317,7 @@ class DungeonMap:
                     world_row = adj_player_row - player_row
                     world_col = adj_player_col - player_col
                     if char == ' ':
-                        # Empty space (cave wall) adjacent to player - mark as seen AND visited
                         map_obj.set_tile(world_row, world_col, ' ', seen=True, visited=True)
-                    elif char != '@' and (world_row, world_col) in map_obj.tiles:
-                        # Non-empty terrain adjacent to player - mark as visited
-                        map_obj.mark_visited(world_row, world_col)
         
         return map_obj
     
