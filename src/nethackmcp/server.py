@@ -331,16 +331,6 @@ class NetHackClient:
                         if not existing or (existing.terrain == " " and not existing.visited):
                             current_map.set_tile(world_row, world_col, " ", seen=True, visited=True)
 
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                world_row = player_world_row + dr
-                world_col = player_world_col + dc
-                existing = current_map.get_tile(world_row, world_col)
-                if existing and existing.terrain == ' ':
-                    current_map.mark_visited(world_row, world_col)
-
         bounds = current_map.bounds
         if bounds["min_row"] is not None:
             for col in range(bounds["min_col"] - 1, bounds["max_col"] + 2):
@@ -351,6 +341,18 @@ class NetHackClient:
                 for col_offset in (bounds["min_col"] - 1, bounds["max_col"] + 1):
                     if not current_map.get_tile(row, col_offset):
                         current_map.set_tile(row, col_offset, " ", seen=False, visited=False)
+
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                world_row = player_world_row + dr
+                world_col = player_world_col + dc
+                existing = current_map.get_tile(world_row, world_col)
+                if existing and existing.terrain == ' ':
+                    current_map.mark_visited(world_row, world_col)
+                elif not existing:
+                    current_map.set_tile(world_row, world_col, ' ', seen=True, visited=True)
 
         result["player_world_pos"] = [player_world_row, player_world_col]
         return result
@@ -905,7 +907,7 @@ async def handle_call_tool(
                 return [
                     types.TextContent(
                         type="text",
-                        text="```\nChoose lower level objectives and stick to them!\n```",
+                        text=f"```\nERROR: Will not set goal to '{goal}'. Choose lower level objectives!\n```",
                     )
                 ]
 
@@ -914,7 +916,7 @@ async def handle_call_tool(
                 return [
                     types.TextContent(
                         type="text",
-                        text=f"```\nGoal is locked. Wait {remaining} more moves before changing.\n```",
+                        text=f"```\nERROR: Cannot set goal to '{goal}'. Goal is locked. Wait {remaining} more moves before changing.\n```",
                     )
                 ]
 

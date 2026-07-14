@@ -112,7 +112,7 @@ class DungeonMap:
         if existing_tile:
             passable = terrain in self.PASSABLE_TERRAIN
             self.tiles[(row, col)] = Tile(
-                terrain=terrain if existing_tile.terrain != ' ' else existing_tile.terrain,
+                terrain=terrain,
                 visited=visited or existing_tile.visited,
                 seen=seen or existing_tile.seen,
                 passable=passable,
@@ -247,11 +247,7 @@ class DungeonMap:
                     terrain = '?'
 
                 if self.player_world_pos and (row, col) == self.player_world_pos:
-                    cell_tile = self.get_tile(row, col)
-                    if cell_tile and cell_tile.terrain == '>':
-                        terrain = '!'
-                    else:
-                        terrain = '@'
+                    terrain = '@'
 
                 line += terrain
             
