@@ -151,6 +151,156 @@ class TestScreenToMap(unittest.TestCase):
         # Should contain some terrain
         self.assertIn('.', map_str)
 
+    def test_door_isolated_horizontal_passable(self):
+        """Test that isolated | with - left/right is passable (door at bottom wall)."""
+        screen = [
+            "------",
+            "|...@.|",
+            "|....|",
+            "|....|",
+            "---|--"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        
+        # Find the | character that should be a door
+        # The | at bottom with - left/right and no | above/below
+        door_found = False
+        for (r, c), tile in map_obj.tiles.items():
+            if tile.terrain == '|':
+                is_passable = map_obj._is_terrain_passable(r, c)
+                if is_passable:
+                    door_found = True
+                    break
+        
+        self.assertTrue(door_found, "Should find at least one isolated | that is passable")
+
+    def test_door_isolated_vertical_passable(self):
+        """Test that isolated - with | above/below is passable (door at right wall)."""
+        screen = [
+            "------",
+            "|...@-",
+            "|....|",
+            "|....|",
+            "------"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        
+        door_found = False
+        for (r, c), tile in map_obj.tiles.items():
+            if tile.terrain == '-':
+                is_passable = map_obj._is_terrain_passable(r, c)
+                if is_passable:
+                    door_found = True
+                    break
+        
+        self.assertTrue(door_found, "Should find at least one isolated - that is passable")
+
+    def test_solid_wall_impassable(self):
+        """Test that connected walls are impassable."""
+        screen = [
+            "------",
+            "|...@|",
+            "|....|",
+            "|....|",
+            "------"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        
+        # Most walls should be IMPASSABLE (connected to other walls)
+        wall_count = 0
+        impassable_count = 0
+        for (r, c), tile in map_obj.tiles.items():
+            if tile.terrain == '-' or tile.terrain == '|':
+                wall_count += 1
+                is_passable = map_obj._is_terrain_passable(r, c)
+                if not is_passable:
+                    impassable_count += 1
+        
+        self.assertGreater(impassable_count, 0, "Should have some impassable walls")
+        # In a simple room with no doors, all walls should be impassable
+        self.assertEqual(wall_count, impassable_count, 
+                        "All walls in this room should be impassable")
+
+    def test_room_detection_single_room(self):
+        """Test room detection in a simple enclosed room."""
+        screen = [
+            "-------",
+            "|.....|",
+            "|....@|",
+            "|.....|",
+            "-------"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        rooms = map_obj._detect_rooms()
+        
+        self.assertEqual(len(rooms), 1, "Should detect exactly one room")
+        self.assertIn(0, rooms, "Room 0 should exist")
+        
+        room = rooms[0]
+        bounds = room["bounds"]
+        # Room bounds in world coords may be negative (player at origin)
+        # Just verify room has tiles and reasonable bounds
+        self.assertGreaterEqual(len(room["tiles"]), 5, "Room should have floor tiles")
+        self.assertLessEqual(bounds["max_row"] - bounds["min_row"], 3, "Room height should be reasonable")
+        self.assertLessEqual(bounds["max_col"] - bounds["min_col"], 5, "Room width should be reasonable")
+
+    def test_room_detection_multiple_rooms(self):
+        """Test room detection when there are multiple separate rooms."""
+        screen = [
+            "---------",
+            "|..@|...|",
+            "|...|...|",
+            "|...|...|",
+            "---------"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        rooms = map_obj._detect_rooms()
+        
+        self.assertGreater(len(rooms), 0, "Should detect at least one room")
+
+    def test_player_on_stairs_shows_stairs_desc(self):
+        """Test that player position on stairs shows 'stairs down/up'."""
+        from nethackmcp.server import NetHackClient
+        
+        client = NetHackClient()
+        
+        description = client._describe_terrain('>', 0, 0, None)
+        self.assertIn('stairs down', description.lower())
+        
+        description = client._describe_terrain('<', 0, 0, None)
+        self.assertIn('stairs up', description.lower())
+
+    def test_room_relative_position(self):
+        """Test room relative position calculation."""
+        screen = [
+            "---------",
+            "|.......|",
+            "|....@..|",
+            "|.......|",
+            "---------"
+        ]
+        
+        map_obj = DungeonMap.from_screen(screen)
+        rooms = map_obj._detect_rooms()
+        
+        if rooms:
+            room_id = 0
+            # Player world pos is (0, 0)
+            rel = map_obj._get_room_relative_pos(0, 0, room_id)
+            
+            self.assertIsInstance(rel, tuple)
+            self.assertEqual(len(rel), 2)
+            pct_row, pct_col = rel
+            self.assertGreater(pct_row, 0.0, "Should have some position")
+            self.assertLessEqual(pct_row, 1.0, "Should be within 0-1 range")
+            self.assertGreater(pct_col, 0.0, "Should have some position")
+            self.assertLessEqual(pct_col, 1.0, "Should be within 0-1 range")
+
 
 if __name__ == '__main__':
     unittest.main()

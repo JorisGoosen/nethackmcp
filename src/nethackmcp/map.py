@@ -51,6 +51,7 @@ class DungeonMap:
         self.player_world_pos: tuple[int, int] | None = None
         self.dungeon_offset: tuple[int, int] = (0, 0)
         self.downstairs_pos: tuple[int, int] | None = None
+        self._cached_rooms: dict[int, dict] | None = None
     
     def _get_neighbor(self, row: int, col: int) -> str | None:
         tile = self.get_tile(row, col)
@@ -69,14 +70,154 @@ class DungeonMap:
         if terrain == '-':
             above = self._get_neighbor(row - 1, col)
             below = self._get_neighbor(row + 1, col)
-            return above == '|' and below == '|'
+            left = self._get_neighbor(row, col - 1)
+            right = self._get_neighbor(row, col + 1)
+            # Passable if has | above/below AND no - connecting left/right
+            has_vertical = above == '|' or below == '|'
+            not_connected_horiz = left != '-' and right != '-'
+            return has_vertical and not_connected_horiz
         
         if terrain == '|':
             left = self._get_neighbor(row, col - 1)
             right = self._get_neighbor(row, col + 1)
-            return left == '-' and right == '-'
+            above = self._get_neighbor(row - 1, col)
+            below = self._get_neighbor(row + 1, col)
+            # Passable if has - left/right AND no | connecting above/below
+            has_horizontal = left == '-' or right == '-'
+            not_connected_vert = above != '|' and below != '|'
+            return has_horizontal and not_connected_vert
         
         return False
+    
+    def _flood_fill_room(self, start_row: int, start_col: int, visited: set) -> list[tuple[int, int]]:
+        """Flood fill passable tiles (.), stopping at walls or # tunnels."""
+        from collections import deque
+        
+        room_tiles = []
+        queue = deque([(start_row, start_col)])
+        room_visited = {(start_row, start_col)}
+        
+        while queue:
+            row, col = queue.popleft()
+            room_tiles.append((row, col))
+            
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = row + dr, col + dc
+                if (nr, nc) in room_visited:
+                    continue
+                
+                tile = self.get_tile(nr, nc)
+                if not tile:
+                    continue
+                
+                if tile.terrain == '.':
+                    room_visited.add((nr, nc))
+                    queue.append((nr, nc))
+        
+        return room_tiles
+    
+    def _detect_rooms(self) -> dict[int, dict]:
+        """Detect all rooms using flood-fill on passable tiles."""
+        rooms: dict[int, dict] = {}
+        all_visited: set[tuple[int, int]] = set()
+        room_id = 0
+        
+        potential_starts = [(pos) for pos, tile in self.tiles.items() if tile.terrain == '.']
+        
+        for row, col in potential_starts:
+            if (row, col) in all_visited:
+                continue
+            
+            room_tiles = self._flood_fill_room(row, col, all_visited)
+            
+            if room_tiles:
+                tiles_set = set(room_tiles)
+                all_visited.update(tiles_set)
+                
+                rows = [r for r, c in room_tiles]
+                cols = [c for r, c in room_tiles]
+                
+                rooms[room_id] = {
+                    "tiles": room_tiles,
+                    "bounds": {
+                        "min_row": min(rows),
+                        "max_row": max(rows),
+                        "min_col": min(cols),
+                        "max_col": max(cols),
+                    },
+                    "name": f"Room {room_id}",
+                }
+                room_id += 1
+        
+        return rooms
+    
+    def _get_room_at(self, row: int, col: int) -> int | None:
+        """Get room ID at given position. Returns None if not in a room."""
+        if self._cached_rooms is None:
+            self._cached_rooms = self._detect_rooms()
+        
+        for room_id, room_data in self._cached_rooms.items():
+            if (row, col) in room_data["tiles"]:
+                return room_id
+        return None
+    
+    def _get_room_relative_pos(self, row: int, col: int, room_id: int) -> tuple[float, float]:
+        """Get position within room as percentage from top-left."""
+        if self._cached_rooms is None:
+            self._cached_rooms = self._detect_rooms()
+        
+        room = self._cached_rooms.get(room_id)
+        if not room:
+            return (0.0, 0.0)
+        
+        bounds = room["bounds"]
+        
+        rel_row = row - bounds["min_row"]
+        rel_col = col - bounds["min_col"]
+        
+        room_height = bounds["max_row"] - bounds["min_row"] + 1
+        room_width = bounds["max_col"] - bounds["min_col"] + 1
+        
+        pct_row = rel_row / room_height if room_height > 0 else 0.0
+        pct_col = rel_col / room_width if room_width > 0 else 0.0
+        
+        return (pct_row, pct_col)
+    
+    def _get_dynamic_room_label_pos(self, room_id: int, player_row: int, player_col: int) -> tuple[int, int]:
+        """Get optimal position for room label (avoiding player and stairs)."""
+        if self._cached_rooms is None:
+            self._cached_rooms = self._detect_rooms()
+        
+        room = self._cached_rooms.get(room_id)
+        if not room:
+            return (0, 0)
+        
+        bounds = room["bounds"]
+        min_r, max_r = bounds["min_row"], bounds["max_row"]
+        min_c, max_c = bounds["min_col"], bounds["max_col"]
+        
+        corners = [
+            (min_r + 1, min_c + 1, "top-left"),
+            (min_r + 1, max_c - 1, "top-right"),
+            (max_r - 1, min_c + 1, "bottom-left"),
+            (max_r - 1, max_c - 1, "bottom-right"),
+        ]
+        
+        corners_with_stairs = []
+        for r, c, name in corners:
+            tile = self.get_tile(r, c)
+            has_stairs = tile and tile.terrain in ('<', '>')
+            is_player = (r, c) == (player_row, player_col)
+            if not has_stairs and not is_player:
+                corners_with_stairs.append((r, c, name))
+        
+        if not corners_with_stairs:
+            return (min_r + 1, min_c + 1)
+        
+        farthest_corner = max(corners_with_stairs, 
+                             key=lambda x: abs(x[0] - player_row) + abs(x[1] - player_col))
+        
+        return (farthest_corner[0], farthest_corner[1])
     
     def _is_adjacent_to_passable(self, row: int, col: int) -> bool:
         for dr in [-1, 0, 1]:
@@ -126,6 +267,7 @@ class DungeonMap:
                 passable=passable,
             )
         tile = self.tiles[(row, col)]
+        self._cached_rooms = None
         if not (terrain == ' ' and not tile.visited):
             self._update_bounds(row, col)
     
@@ -226,34 +368,58 @@ class DungeonMap:
             max_col = max(max_col, max(c for r, c in visited_tiles) + padding)
         
         map_lines = [""]
+        rooms = self._detect_rooms()
+        self._cached_rooms = rooms
+        
+        room_labels: dict[tuple[int, int], str] = {}
+        if rooms and self.player_world_pos:
+            for room_id, room_data in rooms.items():
+                if room_data["tiles"]:
+                    label_row, label_col = self._get_dynamic_room_label_pos(
+                        room_id, self.player_world_pos[0], self.player_world_pos[1]
+                    )
+                    room_labels[(label_row, label_col)] = str(room_id)
+        
         for row in range(min_row, max_row + 1):
             line = ""
             for col in range(min_col, max_col + 1):
-                tile = self.get_tile(row, col)
-                
-                if tile and (tile.visited or tile.seen):
-                    terrain = tile.terrain
-                elif tile:
-                    terrain = tile.terrain
+                if (row, col) in room_labels:
+                    terrain = room_labels[(row, col)]
                 else:
-                    terrain = ' '
-                
-                if terrain is None or len(terrain) != 1:
-                    terrain = ' '
-                
-                if terrain == ' ' and tile and tile.visited:
-                    terrain = 'X'
-                elif terrain == ' ' and self._is_adjacent_to_passable(row, col):
-                    terrain = '?'
+                    tile = self.get_tile(row, col)
+                    
+                    if tile and (tile.visited or tile.seen):
+                        terrain = tile.terrain
+                    elif tile:
+                        terrain = tile.terrain
+                    else:
+                        terrain = ' '
+                    
+                    if terrain is None or len(terrain) != 1:
+                        terrain = ' '
+                    
+                    if terrain == ' ' and tile and tile.visited:
+                        terrain = 'X'
+                    elif terrain == ' ' and self._is_adjacent_to_passable(row, col):
+                        terrain = '?'
 
-                if self.player_world_pos and (row, col) == self.player_world_pos:
-                    terrain = '@'
+                    if self.player_world_pos and (row, col) == self.player_world_pos:
+                        terrain = '@'
 
                 line += terrain
             
             map_lines.append(line)
         
-        return "\n".join(map_lines) + "\n"
+        result = "\n".join(map_lines) + "\n"
+        
+        if rooms:
+            room_header = "\n### ROOMS ###\n"
+            for room_id, room_data in rooms.items():
+                bounds = room_data["bounds"]
+                room_header += f"Room {room_id}: rows {bounds['min_row']}-{bounds['max_row']}, cols {bounds['min_col']}-{bounds['max_col']}\n"
+            result += room_header
+        
+        return result
     
     @classmethod
     def from_screen(cls, screen_lines: list[str], game_start: int = 6, game_end: int = 15) -> "DungeonMap":
