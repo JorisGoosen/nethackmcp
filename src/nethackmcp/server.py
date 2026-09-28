@@ -48,10 +48,19 @@ You are connected to NetHack through this MCP server.
 
 ## Tile legend:
 - `@` you
-- `.` floor | `#` cavefloor | `+` door (all passable)
+- `.` floor (passable)
+- `#` cavefloor (passable, acts as wall for room detection)
+- `+` door (passable)
 - `>` stairs down (passable)
-- `| -` walls | ` ` rockwall | `<` stairs up (all impassable)
-- `X` visited rockwall | `?` unexplored adjacent
+- `<` stairs up (passable)
+- `| -` walls (IMPASSABLE unless isolated as a door)
+- ` ` rockwall (IMPASSABLE)
+- `X` visited rockwall | `?` unvisited passable terrain
+
+### Room Detection:
+- Rooms are enclosed areas of floor tiles (.) bounded by walls (|, -, space, #)
+- Rooms are numbered 0, 1, 2... per dungeon level
+- Player position shows room number and position within room
 
 ## Important:
 The state hints show what is in each direction from `@` with visited status.
@@ -195,6 +204,30 @@ class NetHackClient:
         import glob
 
         return glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
+
+    def _describe_terrain(self, terrain_char: str, row: int, col: int, current_map: DungeonMap) -> str:
+        """Describe the terrain at player position."""
+        if terrain_char == '>':
+            return "stairs down"
+        elif terrain_char == '<':
+            return "stairs up"
+        elif terrain_char == '+':
+            return "door"
+        elif terrain_char in ('|', '-'):
+            if current_map._is_terrain_passable(row, col):
+                return "door (isolated wall)"
+            else:
+                return "wall"
+        elif terrain_char == '#':
+            return "cave floor"
+        elif terrain_char == '.':
+            return "floor"
+        elif terrain_char == ' ':
+            if current_map.get_tile(row, col) and current_map.get_tile(row, col).visited:
+                return "visited rockwall"
+            return "unexplored rockwall"
+        else:
+            return terrain_char
 
     def _get_session_name(self) -> str:
         """Get or create a tmux session name."""
@@ -708,7 +741,17 @@ class NetHackClient:
                         terrain_char = player_tile.terrain
                     else:
                         terrain_char = "unknown"
-                    state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_str + "\n\nPlayer is STANDING ON TOP OFF: " + terrain_char
+                    
+                    description = self._describe_terrain(terrain_char, pw_row, pw_col, current_map)
+                    
+                    room_id = current_map._get_room_at(pw_row, pw_col)
+                    if room_id is not None:
+                        rel_pos = current_map._get_room_relative_pos(pw_row, pw_col, room_id)
+                        room_name = f"Room {room_id}"
+                        description += f" (in {room_name}, {rel_pos[0]:.0%} down, {rel_pos[1]:.0%} right from room origin)"
+                    
+                    state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_str + "\n\n" \
+                                    f"Player Position: World ({pw_row}, {pw_col}) - Standing on {description}"
 
         if "--More--" in raw_text:
             state["screen"] = state["screen"] + '\nSend literal string "Enter" to continue beyond --More--'
@@ -741,7 +784,7 @@ class NetHackClient:
 #  MCP server
 # ------------------------------------------------------------------ #
 
-server = Server("nethack-mcp")
+server = Server("nethack-mcp", version="0.1.0", instructions=SERVER_INSTRUCTIONS)
 _fullscreen = False
 
 
@@ -1001,6 +1044,20 @@ async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = Fa
 
     sse = mcp.server.sse.SseServerTransport("/messages/")
 
+    # Streamable HTTP transport (POST/GET/DELETE on /mcp) — what modern MCP
+    # clients like OpenCode >= 2.0 use; they no longer fall back to SSE.
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    session_manager = StreamableHTTPSessionManager(
+        app=server,
+        event_store=None,
+        json_response=True,
+        stateless=True,
+    )
+
+    async def handle_streamable_http(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
     async def handle_sse(scope, receive, send):
         async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
             caps = server.get_capabilities(
@@ -1025,16 +1082,24 @@ async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = Fa
             if path == "/sse" and scope["method"] == "GET":
                 await handle_sse(scope, receive, send)
                 return
+            elif path == "/health" and scope["method"] == "GET":
+                response = PlainTextResponse("ok")
+                await response(scope, receive, send)
+                return
+            elif path == "/mcp":
+                await handle_streamable_http(scope, receive, send)
+                return
             elif path.startswith("/messages/") and scope["method"] == "POST":
                 await sse.handle_post_message(scope, receive, send)
                 return
         response = PlainTextResponse("Not found", status_code=404)
         await response(scope, receive, send)
 
-    print(f"NetHack MCP server listening on http://{host}:{port}/sse", flush=True)
+    print(f"NetHack MCP server listening on http://{host}:{port}/mcp and /sse", flush=True)
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server_uv = uvicorn.Server(config)
-    await server_uv.serve()
+    async with session_manager.run():
+        await server_uv.serve()
 
 
 def main() -> None:
