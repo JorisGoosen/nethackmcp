@@ -107,7 +107,24 @@ drawn `+` while it is **shut** and as the wall it sits in (`|`/`-`) once it is
 The rule that makes `?` meaningful: as soon as you are adjacent, a `?` resolves
 into `X` (it stayed blank, so it is rockwall) or into the terrain now drawn
 there (`.`, `#`, `+`, `<`, `>`).  Nothing blank is ever recorded as a wall, and
-nothing is ever `?` unless you could walk up to it.
+nothing is ever `?` unless you could walk up to it.  A tile that only ever showed
+a monster or an item is remembered as *guessed* ground: certainly not a wall, but
+which kind of ground is still an open question that standing next to it settles.
+
+### How a screen is placed
+
+Your position comes from the **screen**, not from the keys you sent.  The server
+matches what is drawn against what it remembers and takes the alignment that
+contradicts nothing, nearest first; where the keyboard says you should have ended
+up is only where it starts looking.  That matters because keystrokes lie - a step
+into a wall, a monster blocking the corridor, a run key that stopped early, a
+teleport, or the message window changing height and sliding the whole dungeon a
+row.  When a key did not do what it was asked, the `MOVE` note says so and names
+what was in the way.
+
+If a screen disagrees with memory you get a warning saying how many remembered
+tiles disagree.  Believe the screen in that moment: the map around you may be
+stale until the alignment settles, so re-read it before trusting a long route.
 
 ## Coordinates and routes
 
@@ -132,7 +149,9 @@ refuses those, so approach a door from the side it opens onto.
 - Monsters, items and messages only appear in the raw `SCREEN`; the map stores
   geometry.  A tile showing a monster or item is remembered as walkable ground,
   because nothing is ever drawn inside rockwall.  `I` on the real screen is not
-  a monster either: it marks where an unseen monster was last heard.
+  a monster either: it marks where an unseen monster was last heard.  And a
+  transient effect - a zap's beam, an explosion's `*` - is drawn over
+  anything at all, walls included, so it says nothing about the tile.
 - Memory per level survives going downstairs and back up.
 - `nethack_map` re-reads just the map when you do not need the screen again.
 """

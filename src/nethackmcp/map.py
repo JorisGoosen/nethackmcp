@@ -111,7 +111,13 @@ def tile_matches(drawn: str, tile: Tile) -> int:
         # a blank is agreement and any glyph at all means we are not here
         return 1 if drawn == " " else -1
     if drawn == " ":
-        # everything remembered was drawn once, and the game does not forget
+        # everything remembered was drawn once, and the game does not forget.
+        # A *guessed* tile is the exception worth knowing about: it was never
+        # drawn as terrain, only seen under a monster or an item, and a glyph
+        # there can also have been a transient effect (a zap or an explosion is
+        # drawn over rockwall too).  Such a blank should retire the guess rather
+        # than count against the alignment - until it does, a wrong guess is
+        # reported as a conflict.
         return -1 if tile.memory else 0
     if drawn not in VISIBLE_TERRAIN:
         # the player, a monster, an item: all of them stand on ground.  A wall
