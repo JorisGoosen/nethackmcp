@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from nethackmcp.map import VISIBLE_TERRAIN
-from nethackmcp.server import NetHackClient
+from nethackmcp.server import NetHackClient, keys_for
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -28,7 +28,10 @@ def real_lines():
 
 
 def load(client, lines, expected_world=None):
-    client.current_level = 1
+    """Apply a screen the way ``get_state`` does: adopt the depth on the status
+    line first, so every screen is merged into its own level's map."""
+    level = client._extract_level(lines)
+    client.current_level = level if level is not None else 1
     return client.update_map(lines, expected_world=expected_world)
 
 
@@ -36,25 +39,30 @@ def scroll(lines, dr, dc, player=(18, 46)):
     """Move the dungeon by (dr, dc) while the player stays on screen.
 
     That is exactly what NetHack does when you walk towards the edge of the
-    viewport: the level slides, ``@`` does not.
+    viewport: the level slides, ``@`` does not.  The map window is padded to a
+    fixed grid first, because a real pane is a fixed grid too: sliding must
+    lose columns off one edge and reveal blank at the other, never truncate a
+    row of terrain into nothing.
     """
     pr, pc = player
-    bare = [list(line) for line in lines]
+    width = max(len(line) for line in lines)
+    bare = [list(line.ljust(width)) for line in lines]
     bare[pr][pc] = "."  # the tile under @ keeps its terrain
     out = []
-    for i in range(len(lines)):
+    for i in range(len(bare)):
         if 1 <= i <= 21:
             row = []
-            for j in range(len(lines[i])):
+            for j in range(width):
                 src_r, src_c = i - dr, j - dc
-                if 1 <= src_r <= 21 and 0 <= src_c < len(bare[src_r]):
+                if 1 <= src_r <= 21 and 0 <= src_c < width:
                     row.append(bare[src_r][src_c])
                 else:
                     row.append(" ")
             out.append("".join(row))
         else:
-            out.append(lines[i])
-    out[pr] = out[pr][:pc] + "@" + out[pr][pc + 1 :]
+            out.append("".join(bare[i]))
+    row = out[pr]
+    out[pr] = row[:pc] + "@" + row[pc + 1 :]
     return out
 
 
@@ -214,14 +222,37 @@ def test_a_misaligned_screen_is_corrected(client, real_lines):
     """If the map drifts, terrain matching pulls it back onto the walls."""
     load(client, real_lines)
     dungeon_map = client.maps[1]
-    dungeon_map.dungeon_offset = (  # deliberately wrong by one column
-        dungeon_map.dungeon_offset[0],
-        dungeon_map.dungeon_offset[1] + 1,
-    )
-    cells = dungeon_map.screen_cells(real_lines, (2, 21))
-    solved = dungeon_map.solve_offset(cells, (18, 46), search_range=4)
-    assert solved != dungeon_map.dungeon_offset
-    assert solved[1] == dungeon_map.dungeon_offset[1] - 1
+    drifted = (dungeon_map.dungeon_offset[0], dungeon_map.dungeon_offset[1] + 1)
+    dungeon_map.dungeon_offset = drifted  # deliberately wrong by one column
+    solved = dungeon_map.solve_offset(real_lines, (2, 21), (18, 46))
+    assert solved["offset"] != drifted
+    assert solved["offset"] == (drifted[0], drifted[1] - 1)
+    assert solved["conflicts"] == 0
+
+
+def test_a_route_of_keys_never_maps_the_same_room_twice(client, real_lines):
+    """The bug that duplicated a level: several keys in one command mean the
+    server has no single expected position to go on, so the screen alone has to
+    say where we are - and it does."""
+    load(client, real_lines)
+    dungeon_map = client.maps[1]
+    known = {pos: t.terrain for pos, t in dungeon_map.tiles.items() if t.memory}
+    before = dungeon_map.bounds
+
+    # what "hhhy" looks like on a level that does not scroll: @ walks four
+    # columns west, the terrain stays exactly where it was
+    pr, pc = 18, 46
+    walked = [line[:] for line in real_lines]
+    row = list(walked[pr])
+    row[pc], row[pc - 4] = ".", "@"
+    walked[pr] = "".join(row)
+    info = load(client, walked)  # expected_world=None: a multi-key route
+
+    assert info["conflicts"] == 0, "the screen was matched somewhere else"
+    assert dungeon_map.player_world_pos == (0, -4)
+    assert dungeon_map.bounds == before, "a second copy of the level appeared"
+    for pos, terrain in known.items():
+        assert dungeon_map.terrain_at(*pos) == terrain, f"{pos} smeared"
 
 
 def test_blocked_move_into_a_seen_wall_keeps_the_wall(client, real_lines):
@@ -327,3 +358,81 @@ def test_menu_still_blocks_map_learning(client, real_lines):
         for pos, tile in before.items():
             if tile.memory:
                 assert client.maps[1].terrain_at(*pos) == tile.terrain
+
+
+# --------------------------------------------------------------------------- #
+#  command string -> keystrokes
+# --------------------------------------------------------------------------- #
+
+
+def test_extended_command_is_typed_after_the_hash():
+    """'#' is this build's extended-command key; the name goes after it."""
+    assert keys_for("#force") == [("text", "#force"), ("keys", "Enter")]
+
+
+def test_extended_command_is_not_sent_as_meta_x():
+    """Escape cancels the pending command, then the name's letters start moving.
+
+    The old M-x route made `#quit` reach `q` (quaff) and answer it with `uit`.
+    """
+    for name in ("#quit", "#kick", "#herecmdmenu"):
+        actions = keys_for(name)
+        assert all(value != "Escape" for _, value in actions), name
+        assert all(value != "x" for _, value in actions), name
+
+
+def test_caret_command_is_a_control_key():
+    assert keys_for("^X") == [("keys", "C-x")]
+    assert keys_for("^D") == [("keys", "C-d")]
+    # a lone ^ is the letter: it examines an adjacent trap
+    assert keys_for("^") == [("text", "^")]
+
+
+def test_ordinary_commands_are_sent_as_literal_text():
+    """Never send-keys without -l: 'Enter' as text is not a carriage return."""
+    for command in ("mh", ",", "40j", "F", "o", "Enter the dungeon"):
+        assert keys_for(command) == [("text", command)]
+
+
+def test_named_keys_stay_named_keys():
+    assert keys_for("Escape") == [("keys", "Escape")]
+    assert keys_for("\n") == [("keys", "Enter")]
+
+
+# --------------------------------------------------------------------------- #
+#  one map per level
+# --------------------------------------------------------------------------- #
+
+
+def remembered(dungeon_map):
+    return {pos: tile.terrain for pos, tile in dungeon_map.tiles.items() if tile.memory}
+
+
+def test_each_level_keeps_its_own_memory(client, real_lines):
+    """Going down and coming back must not mix two levels up."""
+    load(client, real_lines)
+    level_one = remembered(client.maps[1])
+    assert level_one
+
+    deeper = [line.replace("Dlvl:1", "Dlvl:3") for line in real_lines]
+    load(client, deeper)
+    assert client.current_level == 3
+    assert client.maps[3].tiles  # level 3 got its own map from the same screen
+
+    load(client, real_lines)
+    assert client.current_level == 1
+    assert remembered(client.maps[1]) == level_one, "level 1's memory was written over"
+
+
+def test_a_new_level_anchors_where_the_hero_lands(client, real_lines):
+    """A level we have never seen starts its coordinates at the player, and then
+    keeps them: walking must not re-anchor the map we have just drawn."""
+    load(client, real_lines)
+    deeper = [line.replace("Dlvl:1", "Dlvl:2") for line in real_lines]
+    load(client, deeper)
+    assert client.maps[2].player_world_pos == (0, 0)
+
+    slid = scroll(deeper, 0, -5)
+    load(client, slid)
+    assert client.maps[2].player_world_pos == (0, 5), "the origin slid with the screen"
+    assert client.maps[1].player_world_pos == (0, 0), "level 1 was redrawn by level 2"

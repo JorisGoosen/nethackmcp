@@ -15,12 +15,16 @@ The rules under test:
 from nethackmcp.map import (
     CAVE,
     DOOR,
+    DOWN,
     FLOOR,
     LIQUID,
     UP,
     WALL_H,
     WALL_V,
     DungeonMap,
+    Tile,
+    route_displacement,
+    tile_matches,
 )
 
 ROOM_SCREEN = [
@@ -229,8 +233,7 @@ def test_viewport_scroll_follows_the_terrain():
 
 def test_keyboard_beats_matching_in_an_ambiguous_corridor():
     """One `l` step must move exactly one tile even with nothing to match on."""
-    corridor = ["#########", "#.......#", "#########"]
-    dungeon_map = build(corridor, player=(1, 1))
+    dungeon_map = build(["#########", "#@......#", "#########"], player=(1, 1))
     # player walks east: screen keeps looking identical except for the @
     moved = ["#########", "#.@.....#", "#########"]
     dungeon_map.apply_screen(
@@ -242,11 +245,13 @@ def test_keyboard_beats_matching_in_an_ambiguous_corridor():
 def test_unremembered_tiles_do_not_score():
     """Alignment must not be rewarded for 'explaining' tiles we never saw."""
     dungeon_map = build(ROOM_SCREEN)
-    cells = DungeonMap.screen_cells(ROOM_SCREEN, (0, len(ROOM_SCREEN) - 1))
-    agree, comparable, conflicts = dungeon_map.score_offset(cells, (500, 500))
-    assert comparable == 0.0
-    assert agree == 0.0
-    assert conflicts == 0.0
+    index = dungeon_map.remembered_by_row()
+    matches, conflicts, coverage = dungeon_map.score_offset(
+        ROOM_SCREEN, (0, len(ROOM_SCREEN) - 1), (500, 500), index, max(len(l) for l in ROOM_SCREEN)
+    )
+    assert coverage == 0  # the window does not even overlap memory
+    assert matches == 0
+    assert conflicts == 0
 
 
 def test_keyboard_is_refused_when_it_contradicts_memory():
@@ -258,6 +263,154 @@ def test_keyboard_is_refused_when_it_contradicts_memory():
     )
     assert dungeon_map.player_world_pos == (0, 0)  # not fooled
     assert info["conflicts"] == 0
+
+
+# --------------------------------------------------------------------------- #
+#  what the alignment is allowed to believe
+# --------------------------------------------------------------------------- #
+
+
+def remembered(lines, player=(2, 5)):
+    dungeon_map = build(lines, player)
+    return dungeon_map, dungeon_map.remembered_by_row()
+
+
+def test_remembered_terrain_that_stops_being_drawn_is_a_conflict():
+    """The game never forgets terrain it showed you: memory that lands on a
+    blank says this alignment is wrong, and that is the strongest signal there
+    is."""
+    dungeon_map, index = remembered(ROOM_SCREEN)
+    blanked = [line[:5] + "     " for line in ROOM_SCREEN]
+    matches, conflicts, coverage = dungeon_map.score_offset(
+        blanked, (0, 4), dungeon_map.dungeon_offset, index, 11
+    )
+    assert coverage == 55
+    assert conflicts > 20, "a screen that erased half the room scored as a match"
+    assert matches < conflicts
+
+
+def test_confirmed_rockwall_is_allowed_to_sit_on_a_blank():
+    """``X`` is what blank looks like: agreeing with nothing drawn is exactly
+    right, so it must not be counted against an alignment."""
+    dungeon_map, _ = remembered(ROOM_SCREEN)
+    dungeon_map.mark_solid(-2, 6)  # beyond the east wall, never drawn
+    tile = dungeon_map.get_tile(-2, 6)
+    assert tile.solid and not tile.memory
+    assert tile_matches(" ", tile) == 1
+
+
+def test_the_player_tile_matches_whatever_ground_it_stands_on():
+    """``@`` hides the tile under it, so it has to agree with floor, corridor,
+    water, a stair and either state of a door - and with no wall."""
+    for terrain in (FLOOR, CAVE, LIQUID, UP, DOWN):
+        assert tile_matches("@", Tile(terrain=terrain)) == 1, terrain
+    assert tile_matches("@", Tile(terrain=WALL_V)) == 0
+    assert tile_matches("@", Tile(terrain=WALL_H, doorway=True)) == 1
+    assert tile_matches("@", Tile(solid=True)) == -1  # rockwall we bumped into
+    assert tile_matches("@", Tile(terrain=CAVE, solid=True)) == -1  # iron bars
+    assert tile_matches("@", Tile()) == 0  # never seen: the hero is new ground
+
+
+def test_an_open_door_matches_a_shut_one_and_its_wall():
+    """One doorway, drawn three different ways depending on its state."""
+    door = Tile(terrain=DOOR, doorway=True)
+    assert tile_matches("|", door) == 1  # swung open: drawn as the wall in it
+    assert tile_matches("+", door) == 1
+    assert tile_matches(".", door) == 1  # the door is gone: a doorway still
+    assert tile_matches("#", door) == -1
+
+
+def test_a_monster_standing_there_proves_ground_not_wall():
+    """Any glyph we do not track is something standing on a tile, so it can
+    never agree with rockwall or iron bars - and it cannot outvote a remembered
+    wall either, because an open door is drawn as the wall it sits in."""
+    assert tile_matches("d", Tile(terrain=CAVE)) == 1
+    assert tile_matches("$", Tile(terrain=FLOOR)) == 1
+    assert tile_matches("Z", Tile(terrain=WALL_H)) == 0  # may be an open door
+    assert tile_matches("Z", Tile(terrain=WALL_H, doorway=True)) == 1  # it is one
+    assert tile_matches("d", Tile(solid=True)) == -1
+    # and the guess does not overwrite the doorway it is standing in
+    dungeon_map = DungeonMap()
+    dungeon_map.observe(0, 0, DOOR)
+    dungeon_map.observe_guess(0, 0)
+    assert dungeon_map.terrain_at(0, 0) == DOOR
+
+
+def test_walking_into_an_open_door_learns_it_was_a_doorway():
+    """A ``|`` we only ever saw standing open is still a way through: getting
+    inside it settles the question, and the tile must stop being a wall."""
+    room = [
+        "------",
+        "|....|",
+        "|...@|",  # the hero inside; the west wall is one '|' at col 0
+        "|....|",
+    ]
+    dungeon_map = build(room, player=(2, 4))
+    wall = (0, -4)  # world position of that '|' in the hero's row
+    assert dungeon_map.terrain_at(*wall) == WALL_V
+    assert not dungeon_map.get_tile(*wall).doorway
+
+    stepped_in = [
+        "------",
+        "|....|",
+        "@....|",  # the hero is standing in it now: it was an open door
+        "|....|",
+    ]
+    info = dungeon_map.apply_screen(stepped_in, (2, 0), (0, 3), expected_world=wall)
+    assert info["conflicts"] == 0, "standing in a doorway is not a contradiction"
+    tile = dungeon_map.get_tile(*wall)
+    assert tile.doorway and tile.door_open and tile.visited
+    assert dungeon_map.is_passable(*wall)
+
+
+def test_an_inferred_floor_never_disagrees_with_the_real_glyph():
+    """We guessed 'floor' because the hero was standing there.  When the game
+    finally draws that tile as a corridor it has not contradicted us."""
+    dungeon_map = build(["#########", "#@......#", "#########"], player=(1, 1))
+    tile = dungeon_map.get_tile(*dungeon_map.player_world_pos)
+    assert tile.terrain == FLOOR and tile.guessed
+    assert tile_matches("#", tile) == 1
+    assert tile_matches("}", tile) == 1
+    assert tile_matches("|", tile) == 1  # even a wall: we never saw this tile
+
+
+def test_an_untested_alignment_is_not_a_match():
+    """An offset that puts the window off the edge of memory contradicts nothing
+    only because it looks at nothing."""
+    dungeon_map, index = remembered(ROOM_SCREEN)
+    far = (dungeon_map.dungeon_offset[0] + 9, dungeon_map.dungeon_offset[1] + 9)
+    _, _, coverage = dungeon_map.score_offset(ROOM_SCREEN, (0, 4), far, index, 11)
+    assert coverage == 0
+    solved = dungeon_map.solve_offset(ROOM_SCREEN, (0, 4), (2, 5))
+    assert solved["offset"] == dungeon_map.dungeon_offset
+
+
+def test_the_search_starts_where_the_keys_say_and_stops_at_the_first_clean_fit():
+    """A whole route is one command, so the starting point has to be the end of
+    the route, not the tile we left."""
+    assert route_displacement("hhhy") == (-1, -4)
+    assert route_displacement("jnnjj") == (5, 2)
+    assert route_displacement("mh") == (0, -1)
+    assert route_displacement("olo") is None  # opens a door: not walking
+    assert route_displacement("H") is None  # a run key travels an unknown way
+    assert route_displacement("ff") is None
+
+
+def test_a_row_trimmed_by_tmux_is_still_a_blank():
+    """tmux reports a row without its trailing blanks, so a tile next to us that
+    is past the end of the line was drawn *nothing* - which means rockwall, not
+    'still unknown'."""
+    room = [
+        "|....",
+        "|.@",  # this row stops after the hero: east of it nothing was drawn
+        "|....",
+    ]
+    dungeon_map = build(room, player=(1, 2))
+    here = dungeon_map.player_world_pos
+    assert dungeon_map.glyph_at(here[0], here[1] + 1) == "X"
+    assert (here[0], here[1] + 1) not in dungeon_map.frontier()
+    # the very same column drawn on a longer row next door is floor, not wall
+    assert dungeon_map.glyph_at(here[0] + 1, here[1] + 1) == "."
 
 
 def test_conflicting_screen_keeps_memory_instead_of_smearing():

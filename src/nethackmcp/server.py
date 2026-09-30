@@ -37,6 +37,7 @@ from nethackmcp.map import (
     LIQUID,
     VISIBLE_TERRAIN,
     DungeonMap,
+    route_displacement,
 )
 
 SERVER_INSTRUCTIONS = """\
@@ -65,8 +66,11 @@ tmux session and keeps a *memory map* of every level for you.
 - **Travel**: `_` lets NetHack pathfind to a spot you pick on the map
 - **Menus of what you can do**: `#herecmdmenu`, `#therecmdmenu`
 - **Status**: `^X`   **Event journal**: `v`   **Save and quit**: `S`
-- **Extended command**: `#name` (sent as M-x name <ret>)
+- **Extended command**: `#name` - `#` is the extended-command key in this build,
+  the name is typed after it and completed as you go (`#force`, `#kick`,
+  `#lookaround`, `#herecmdmenu`...).  Send it whole: `nethack_move("#force")`
 - **Answer a prompt**: send the letter the question asks for (`y`, `n`, `q`, ...)
+- **Cancel** whatever is pending: `Escape` (also closes a menu); `?` for help
 
 You do not need to clear message pages: when the screen sits on `--More--`, the
 next command drains it with Space first and reports what it skimmed past.
@@ -150,6 +154,36 @@ _NAMED_KEYS = {
     "Ctrl+X": "C-x",
     "Ctrl+Z": "C-z",
 }
+
+#: an action for tmux: ``("keys", "Enter")`` or ``("text", "#force")``
+KeyAction = tuple[str, str]
+
+
+def keys_for(command: str) -> list[KeyAction]:
+    """Translate one command string into what tmux should do with it.
+
+    ``("keys", name)`` is ``tmux send-keys <name>`` and ``("text", s)`` is
+    ``tmux send-keys -l s``: literal, so a key string is never reinterpreted as
+    a tmux key name (``"Enter"`` typed as text is not a carriage return).
+
+    Two things here are easy to get wrong and both were:
+
+    * ``#`` is this build's extended-command key (``src/cmd.c``, the table entry
+      for ``doextcmd``; ``gc.Cmd.extcmd_char``) and the command name is typed
+      after it as a line.  M-x is *not* an extended-command initiator: Escape
+      cancels whatever is pending and the letters of the name are then read as
+      separate commands - ``#quit`` used to reach ``q`` (quaff) and answer it
+      with ``uit``, which is how a quit attempt ended in ``a - a +0 katana``.
+    * ``^X`` written out is Ctrl-X, not the letter ``^`` (examine trap) and then
+      ``X``.  A lone ``^`` is still the letter.
+    """
+    if command in _NAMED_KEYS:
+        return [("keys", _NAMED_KEYS[command])]
+    if len(command) == 2 and command[0] == "^" and command[1].isalpha():
+        return [("keys", "C-" + command[1].lower())]
+    if command.startswith("#"):
+        return [("text", command), ("keys", "Enter")]
+    return [("text", command)]
 
 
 def _log_error(context: str, exc: Exception) -> None:
@@ -389,12 +423,18 @@ class NetHackClient:
         before_lines: list[str],
         after_pos: tuple[int, int] | None,
     ) -> str | None:
-        """Reconcile a single-step move with the map; name what blocked us."""
-        if before_pos is None or after_pos is None or len(command) != 1:
+        """Reconcile a move with the map; name what blocked us.
+
+        A route of several keys is reported the same way: if the hero did not
+        move at all then it was the *first* key that was refused, which is the
+        only step worth explaining.
+        """
+        if before_pos is None or after_pos is None:
             return None
-        step = KEY_DIRS.get(command.lower())
-        if step is None or command.isupper():
-            return None
+        if route_displacement(command) is None:
+            return None  # a run key or something that is not walking
+        first = command[1] if command[0] == "m" and len(command) == 2 else command[0]
+        step = KEY_DIRS[first]
         target = (before_pos[0] + step[0], before_pos[1] + step[1])
         if after_pos != before_pos:
             return None
@@ -415,7 +455,7 @@ class NetHackClient:
             dungeon_map.mark_solid(*target)
             reason = "solid rockwall, nothing was drawn there"
         elif shown == DOOR or (tile is not None and tile.door_closed):
-            reason = f"shut door: open it with 'o{command}', or kick it ('^D')"
+            reason = f"shut door: open it with 'o{first}', or kick it ('^D')"
         elif diagonal and (
             (tile is not None and tile.doorway)
             or dungeon_map.has_door_leaf(before_pos)
@@ -433,7 +473,7 @@ class NetHackClient:
             reason = f"{tile.terrain} wall"
         else:
             reason = "blocked"
-        return f"blocked heading {command} -> ({target[0]},{target[1]}): {reason}"
+        return f"{command!r} went nowhere: blocked heading {first} -> ({target[0]},{target[1]}): {reason}"
 
     # ------------------------------------------------------------------ #
     #  lifecycle
@@ -489,7 +529,8 @@ class NetHackClient:
             elif "Ready to play" in raw:
                 self._send_keys("y")
             elif "--More--" in raw:
-                self._send_keys("Enter")
+                # Space is what this build's pager answers; a letter is eaten
+                self._send_keys("Space")
             else:
                 break
             time.sleep(1.0)
@@ -526,21 +567,21 @@ class NetHackClient:
 
         paused = bool(self._open_prompt(before_lines))
         expected_world = None
-        if not paused and before_pos is not None and len(command) == 1:
-            step = KEY_DIRS.get(command.lower())
-            if step is not None and not command.isupper():
-                expected_world = (before_pos[0] + step[0], before_pos[1] + step[1])
+        if not paused and before_pos is not None:
+            # a frontier route arrives as several keys: add the steps up so the
+            # screen match has somewhere sensible to start looking.  It is only
+            # a starting point - a blocked move makes it wrong, and the screen
+            # decides either way.
+            steps = route_displacement(command)
+            if steps is not None and steps != (0, 0):
+                expected_world = (before_pos[0] + steps[0], before_pos[1] + steps[1])
 
         try:
-            if command in _NAMED_KEYS:
-                self._send_keys(_NAMED_KEYS[command])
-            elif command.startswith("#"):
-                # NetHack extended commands are M-x <name> <ret>
-                self._send_keys("Escape", "x")
-                self._type(command.lstrip("#"))
-                self._send_keys("Enter")
-            else:
-                self._type(command)
+            for kind, payload in keys_for(command):
+                if kind == "keys":
+                    self._send_keys(payload)
+                else:
+                    self._type(payload)
         except subprocess.CalledProcessError as exc:
             return {"status": "error", "error": f"Failed to send command: {exc}"}
 
@@ -746,8 +787,9 @@ class NetHackClient:
         dungeon_map = self.maps.get(self.current_level)
         if info.get("conflicts"):
             state_warning = (
-                f"{info['conflicts']} screen tile(s) contradicted memory - the map "
-                f"may be misaligned (alignment {info.get('alignment')})"
+                f"{info['conflicts']} of the {info['coverage']} remembered tile(s) this "
+                f"screen covers disagree with it (alignment {info.get('alignment')}): the "
+                f"map may be misaligned, so distrust the route until it settles"
             )
         else:
             state_warning = ""
