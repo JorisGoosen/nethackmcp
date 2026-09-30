@@ -1,5 +1,5 @@
 """NetHack MCP Server package."""
 
-from .server import server, main
+from nethackmcp.server import main, server
 
-__all__ = ["server", "main"]
+__all__ = ["main", "server"]

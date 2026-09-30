@@ -1,4 +1,17 @@
-"""MCP server for playing NetHack."""
+"""MCP server for playing NetHack.
+
+The server drives NetHack inside a tmux session and keeps a *memory map* of
+every level (see :mod:`nethackmcp.map`).  Position tracking combines two
+sources so the map stays coherent:
+
+* terrain matching against remembered geometry, and
+* the keyboard: a single movement key always moves exactly one tile, so when
+  the two disagree we trust the key unless the screen clearly contradicts it.
+
+A movement key that does *not* move the player proves the tile it pointed at is
+solid rockwall, which is the only reliable way to tell a wall from unrevealed
+space.
+"""
 
 from __future__ import annotations
 
@@ -16,1036 +29,1077 @@ import mcp.types as types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 
-from nethackmcp.map import DungeonMap
+from nethackmcp.map import (
+    CAVE,
+    DIR_KEYS,
+    DOOR,
+    KEY_DIRS,
+    LIQUID,
+    VISIBLE_TERRAIN,
+    DungeonMap,
+)
 
 SERVER_INSTRUCTIONS = """\
-You are connected to NetHack through this MCP server.
+You are connected to NetHack through this MCP server.  It drives NetHack in a
+tmux session and keeps a *memory map* of every level for you.
 
-## NetHack Commands (short):
+## Commands (vi keys: this build runs with number_pad off)
 
-- **Direction**: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)
-- **Move one step**: [direction]
-- **Move far**: [DIR] (uppercase)
-- **Move silent**: m+[direction]
-- **Pick up**: ,
-- **Drop**: d
-- **Fight**: f+[dir]
-- **Look**: :
-- **Search**: s
-- **Wait/Rest**: .
-- **Inventory**: i
-- **Equipment**: *
-- **Status**: ^X (Ctrl+x)
-- **Extended commands**: #command
-- **Help**: ?
+- **Directions**: h(←) j(↓) k(↑) l(→) y(↖) u(↗) b(↙) n(↘)
+- **Run**: uppercase direction (H J K L Y U B N) runs that way until something
+  happens; `g`+dir runs until something *interesting* is seen, `G`+dir the same
+  but ignoring branching corridors
+- **Move without picking up**: `m`+direction (e.g. `mh`)
+- **Fight**: walk into it, or `F`+direction to attack even where you sense
+  nothing.  `f`+direction is *fire from the quiver*, not fighting
+- **Repeat**: a count before a command repeats it - `20s` searches twenty times
+- **Pick up**: `,`   **Drop**: `d`   **Inventory**: `i`   **What here**: `:`
+- **Wear/wield**: `W`/`w`   **Take off armor**: `T`   **Remove ring/amulet**: `R`
+  **Put on accessory**: `P`
+- **Eat**: `e`   **Drink**: `q`   **Read**: `r`   **Engrave**: `E`   **Throw**: `t`
+- **Zap wand**: `z`   **Cast spell**: `Z`   **Fire ammo**: `f`
+- **Open door**: `o`+direction   **Close door**: `c`+direction   **Apply tool**: `a`
+- **Kick**: `^D`   **Force a lock**: `#force`   (this build has **no** `#knock`)
+- **Search** for secret doors and traps: `s` (stand next to the wall, repeat)
+- **Look**: `:` here, `;` somewhere else, `/` what a symbol is, `^` an adjacent trap
+- **Travel**: `_` lets NetHack pathfind to a spot you pick on the map
+- **Menus of what you can do**: `#herecmdmenu`, `#therecmdmenu`
+- **Status**: `^X`   **Event journal**: `v`   **Save and quit**: `S`
+- **Extended command**: `#name` (sent as M-x name <ret>)
+- **Answer a prompt**: send the letter the question asks for (`y`, `n`, `q`, ...)
 
-## Workflow:
+You do not need to clear message pages: when the screen sits on `--More--`, the
+next command drains it with Space first and reports what it skimmed past.
+Letters do not dismiss `--More--` in this build, which is why that matters.
 
-1. Start a game with nethack_start
-2. Use nethack_move to send commands
-3. Check screen state with nethack_state to see what's happening
-4. Stop with nethack_stop when done
+## What every move returns
 
-## Tile legend:
-- `@` you
-- `.` floor (passable)
-- `#` cavefloor (passable, acts as wall for room detection)
-- `+` door (passable)
-- `>` stairs down (passable)
-- `<` stairs up (passable)
-- `| -` walls (IMPASSABLE unless isolated as a door)
-- ` ` rockwall (IMPASSABLE)
-- `X` visited rockwall | `?` unvisited passable terrain
+`SCREEN` (raw), `NEIGHBOURS` (the eight tiles around you and what the map
+remembers about each), `MAP` (accumulated memory), `FRONTIER` (the places still
+worth exploring, with the keys to reach them) and `MOVE` when your key did not
+do what you asked.
 
-### Room Detection:
-- Rooms are enclosed areas of floor tiles (.) bounded by walls (|, -, space, #)
-- Rooms are numbered 0, 1, 2... per dungeon level
-- Player position shows room number and position within room
+### Map glyphs
 
-## Important:
-The state hints show what is in each direction from `@` with visited status.
-Only move into passable directions listed under "Move:".
+The game's own alphabet where it can be.  From `include/defsym.h`: a door is
+drawn `+` while it is **shut** and as the wall it sits in (`|`/`-`) once it is
+**open**, which is why the map spells the two states out separately.
 
-The server maintains game state using tmux sessions. Each game gets its own tmux session.
+| | |
+|---|---|
+| `@` | you |
+| `.` | floor |
+| `#` | cave floor / corridor (`#` is also iron bars and trees: a bump settles it) |
+| `+` | doorway, door **shut** - `o`+direction opens it, `^D` kicks it in |
+| `'` | doorway, standing **open** - walk through |
+| `<` | stairs up, `>` stairs down (ladders look the same) |
+| `\\|` `-` | walls you have seen |
+| `}` | water or lava: you *can* step in, you would just swim or burn |
+| `^` | a trap you have spotted (the tile is floor - go around it) |
+| `X` | solid: you tried to walk here and could not |
+| `?` | **unrevealed**, and reachable: stand next to it and it becomes real |
+| ` ` | nothing remembered, nothing discoverable from here |
+
+The rule that makes `?` meaningful: as soon as you are adjacent, a `?` resolves
+into `X` (it stayed blank, so it is rockwall) or into the terrain now drawn
+there (`.`, `#`, `+`, `<`, `>`).  Nothing blank is ever recorded as a wall, and
+nothing is ever `?` unless you could walk up to it.
+
+## Coordinates and routes
+
+World coordinates are (row, col): row+1 is south, col+1 is east, the origin is
+where you first appeared on the level.  A frontier entry reads
+
+    N cell(s) next to (r,c), S step(s): <route>, poke with `<probe>`
+    N cell(s) beyond the door at (r,c), S step(s): <route>, open it with `o<dir>`
+
+`route` walks over remembered ground to the tile that looks out over the biggest
+part of that `?` blob; `<probe>` is the one key that makes a `?` real from there,
+so sending route+probe as a single `nethack_move` always learns something
+(`(you are there)` means you already overlook it).  A route carries `o<dir><dir>`
+where it has to open a shut door on the way.  If a door will not open it is
+locked: `#force` it, kick it (`^D`), or search (`s`) for a secret way round.
+
+Routes never plan a **diagonal** step into or out of an intact doorway: NetHack
+refuses those, so approach a door from the side it opens onto.
+
+## Notes
+
+- Monsters, items and messages only appear in the raw `SCREEN`; the map stores
+  geometry.  A tile showing a monster or item is remembered as walkable ground,
+  because nothing is ever drawn inside rockwall.  `I` on the real screen is not
+  a monster either: it marks where an unseen monster was last heard.
+- Memory per level survives going downstairs and back up.
+- `nethack_map` re-reads just the map when you do not need the screen again.
 """
 
-_DIRECTION_OFFSETS: dict[str, tuple[int, int]] = {
-    "h": (0, -1),
-    "j": (1, 0),
-    "k": (-1, 0),
-    "l": (0, 1),
-    "y": (-1, -1),
-    "u": (-1, 1),
-    "b": (1, -1),
-    "n": (1, 1),
-}
-
-_SPECIAL_KEYS: dict[str, str] = {
+#: friendly key names -> tmux key names
+_NAMED_KEYS = {
     "Enter": "Enter",
+    "Return": "Enter",
+    "\n": "Enter",
     "Escape": "Escape",
     "Space": "Space",
     "Tab": "Tab",
-    "Backspace": "Backspace",
+    "Backspace": "BSpace",
     "Ctrl+C": "C-c",
     "Ctrl+D": "C-d",
+    "Ctrl+L": "C-l",
+    "Ctrl+N": "C-n",
+    "Ctrl+P": "C-p",
     "Ctrl+X": "C-x",
     "Ctrl+Z": "C-z",
-    "Ctrl+P": "C-p",
-    "Ctrl+N": "C-n",
-    "Ctrl+L": "C-l",
 }
 
 
 def _log_error(context: str, exc: Exception) -> None:
-    """Log an error to stderr without crashing."""
     print(f"[ERROR] {context}: {exc}", file=sys.stderr, flush=True)
 
 
 class NetHackClient:
-    """Handles NetHack game using persistent tmux sessions."""
+    """Drives one NetHack game in a tmux session and remembers the dungeon."""
 
     TMUX_SESSION_PREFIX = "nethack_"
     STATE_FILE_PREFIX = "/tmp/nethack_state_"
 
-    def __init__(self):
+    def __init__(self, restore: bool = True) -> None:
         self.session_name: str | None = None
         self.state_file: str | None = None
-        self.current_goal: str = "Explore questionmarks"
-        self.goal_counter: int = 0
-        self.goal_locked_until_counter: int = -1
-        self.game_state: dict[str, Any] = {}
-
-        self.maps: dict[int, DungeonMap] = {}
+        self.current_goal: str = ""
         self.current_level: int = 1
-
+        self.maps: dict[int, DungeonMap] = {}
         self.previous_screen: str | None = None
-        self.previous_stripped_screen: list[str] | None = None
+        self.game_state: dict[str, Any] = {}
+        self.cleared_messages: list[str] = []
+        if restore:
+            self._restore_state()
 
-        self._restore_state()
+    # ------------------------------------------------------------------ #
+    #  tmux plumbing
+    # ------------------------------------------------------------------ #
 
-    def _restore_state(self) -> None:
-        """Restore game state from a persisted state file."""
-        existing_state = self._find_existing_state()
-        if not existing_state:
-            return
-
-        try:
-            with open(existing_state, "r") as f:
-                state = json.load(f)
-        except Exception as exc:
-            _log_error("_restore_state: reading state file", exc)
-            return
-
-        try:
-            self.session_name = state.get("session_name")
-            self.state_file = existing_state
-            self.current_goal = state.get("current_goal", "")
-            self.goal_counter = state.get("goal_counter", 0)
-            self.goal_locked_until_counter = state.get("goal_locked_until_counter", -1)
-
-            maps_data = state.get("maps", {})
-            for level_str, map_data in maps_data.items():
-                level = int(level_str)
-                self.maps[level] = DungeonMap.from_dict(map_data)
-
-            self.current_level = state.get("current_level", 1)
-            self.previous_screen = state.get("previous_screen")
-            self.previous_stripped_screen = state.get("previous_stripped_screen", [])
-            self.game_state = state
-        except Exception as exc:
-            _log_error("_restore_state: parsing state", exc)
-
-    def _strip_ansi(self, text: str) -> tuple[str, str]:
-        """Strip ANSI escape codes from text. Returns (stripped_text, colored_text)."""
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
         ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-        stripped = ansi_escape.sub("", text)
-        return stripped, text
+        return ansi_escape.sub("", text)
 
-    def _create_diff(self, current: list[str], previous: list[str]) -> str:
-        """Create character-by-character diff showing changes."""
-        max_lines = max(len(current), len(previous))
-        max_width = max(
-            max(len(line) for line in current) if current else 0,
-            max(len(line) for line in previous) if previous else 0,
+    def _tmux(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        result = subprocess.run(
+            ["tmux", *args], check=check, capture_output=True, text=True
         )
-
-        diff_lines = []
-        for row in range(max_lines):
-            current_line = current[row] if row < len(current) else ""
-            previous_line = previous[row] if row < len(previous) else ""
-
-            diff_row = []
-            has_changes = False
-            for col in range(max_width):
-                current_char = current_line[col] if col < len(current_line) else " "
-                previous_char = previous_line[col] if col < len(previous_line) else " "
-
-                if current_char != previous_char:
-                    diff_row.append(current_char)
-                    has_changes = True
-                else:
-                    diff_row.append(" ")
-
-            diff_line = "".join(diff_row).rstrip()
-            if has_changes and diff_line:
-                diff_lines.append(diff_line)
-
-        return "\n".join(diff_lines)
-
-    def _find_existing_state(self) -> str | None:
-        """Find existing state file from previous game."""
-        import glob
-
-        state_files = glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
-        return state_files[0] if state_files else None
-
-    def _find_all_state_files(self) -> list[str]:
-        """Find all state files from previous games."""
-        import glob
-
-        return glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
-
-    def _describe_terrain(self, terrain_char: str, row: int, col: int, current_map: DungeonMap) -> str:
-        """Describe the terrain at player position."""
-        if terrain_char == '>':
-            return "stairs down"
-        elif terrain_char == '<':
-            return "stairs up"
-        elif terrain_char == '+':
-            return "door"
-        elif terrain_char in ('|', '-'):
-            if current_map._is_terrain_passable(row, col):
-                return "door (isolated wall)"
-            else:
-                return "wall"
-        elif terrain_char == '#':
-            return "cave floor"
-        elif terrain_char == '.':
-            return "floor"
-        elif terrain_char == ' ':
-            if current_map.get_tile(row, col) and current_map.get_tile(row, col).visited:
-                return "visited rockwall"
-            return "unexplored rockwall"
-        else:
-            return terrain_char
-
-    def _get_session_name(self) -> str:
-        """Get or create a tmux session name."""
-        if self.session_name is None:
-            state_file = self._find_existing_state()
-            if state_file:
-                try:
-                    with open(state_file, "r") as f:
-                        state = json.load(f)
-                        self.session_name = state.get("session_name")
-                        self.state_file = state_file
-                        return self.session_name
-                except Exception as exc:
-                    _log_error("_get_session_name: reading state file", exc)
-
-            import random
-            import string
-
-            suffix = "".join(random.choices(string.ascii_lowercase, k=8))
-            self.session_name = f"{self.TMUX_SESSION_PREFIX}{suffix}"
-            self.state_file = None
-        return self.session_name
-
-    def _get_state_file(self) -> str:
-        """Get or create a state file path."""
-        if self.state_file is None:
-            state_file = self._find_existing_state()
-            if state_file:
-                self.state_file = state_file
-                return state_file
-
-            import random
-            import string
-
-            suffix = "".join(random.choices(string.ascii_lowercase, k=8))
-            self.state_file = f"{self.STATE_FILE_PREFIX}{suffix}.json"
-        return self.state_file
-
-    def _is_new_game_screen(self, raw_text: str) -> bool:
-        """Check if the screen shows a new game / character selection screen."""
-        new_game_markers = [
-            "Who are you?",
-            "Do you want your possessions identified?",
-        ]
-        return any(marker in raw_text for marker in new_game_markers)
-
-    def _extract_level_from_status(self, screen_lines: list[str]) -> int | None:
-        """Extract current dungeon level from status bar."""
-        for line in screen_lines:
-            match = re.search(r"Dlvl:\s*(\d+)", line)
-            if match:
-                return int(match.group(1))
-        return None
-
-    # ------------------------------------------------------------------ #
-    #  Map / positioning
-    # ------------------------------------------------------------------ #
-
-    def _find_player(self, screen_lines: list[str]) -> tuple[int, int] | None:
-        """Locate the @ symbol on screen."""
-        for r, line in enumerate(screen_lines):
-            for c, char in enumerate(line):
-                if char == "@":
-                    return (r, c)
-        return None
-
-    def _update_map_from_screen(
-        self, screen_lines: list[str], player_row: int, player_col: int
-    ) -> dict[str, Any]:
-        """Update the dungeon map using terrain matching for offset detection."""
-        result = {
-            "player_world_pos": None,
-            "map_updated": False,
-            "player_moved_world": False,
-            "screen_shifted": False,
-        }
-
-        if self.current_level not in self.maps:
-            self.maps[self.current_level] = DungeonMap(level=self.current_level)
-
-        current_map = self.maps[self.current_level]
-        TERRAIN_CHARS = {"#", ".", "+", "-", "|", "<", ">"}
-        game_start = 2
-        game_end = len(screen_lines) - 3
-
-        if not current_map.tiles:
-            current_map.dungeon_offset = (-player_row, -player_col)
-            current_map.player_world_pos = (0, 0)
-            result["screen_shifted"] = True
-            result["map_updated"] = True
-        else:
-            if current_map.dungeon_offset == (0, 0) and current_map.player_world_pos:
-                current_map.dungeon_offset = (
-                    current_map.player_world_pos[0] - player_row,
-                    current_map.player_world_pos[1] - player_col,
-                )
-
-            old_offset = current_map.dungeon_offset
-            current_map.dungeon_offset = current_map.find_best_dungeon_offset(
-                screen_lines, search_range=20
-            )
-            if current_map.dungeon_offset != old_offset:
-                result["screen_shifted"] = True
-            result["map_updated"] = True
-
-        player_world_row = current_map.dungeon_offset[0] + player_row
-        player_world_col = current_map.dungeon_offset[1] + player_col
-        current_map.player_world_pos = (player_world_row, player_world_col)
-
-        for row in range(game_start, min(game_end + 1, len(screen_lines))):
-            line = screen_lines[row]
-            for col, char in enumerate(line):
-                if char not in TERRAIN_CHARS:
-                    continue
-                tile_char = char
-                world_row = current_map.dungeon_offset[0] + row
-                world_col = current_map.dungeon_offset[1] + col
-                current_map.set_tile(world_row, world_col, tile_char, seen=True)
-
-        current_map.mark_visited(player_world_row, player_world_col)
-
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                adj_row = player_row + dr
-                adj_col = player_col + dc
-                if 0 <= adj_row < len(screen_lines):
-                    line = screen_lines[adj_row]
-                    if 0 <= adj_col < len(line) and line[adj_col] == " ":
-                        world_row = current_map.dungeon_offset[0] + adj_row
-                        world_col = current_map.dungeon_offset[1] + adj_col
-                        existing = current_map.get_tile(world_row, world_col)
-                        if not existing or (existing.terrain == " " and not existing.visited):
-                            current_map.set_tile(world_row, world_col, " ", seen=True, visited=True)
-
-        bounds = current_map.bounds
-        if bounds["min_row"] is not None:
-            for col in range(bounds["min_col"] - 1, bounds["max_col"] + 2):
-                for row_offset in (bounds["min_row"] - 1, bounds["max_row"] + 1):
-                    if not current_map.get_tile(row_offset, col):
-                        current_map.set_tile(row_offset, col, " ", seen=False, visited=False)
-            for row in range(bounds["min_row"], bounds["max_row"] + 1):
-                for col_offset in (bounds["min_col"] - 1, bounds["max_col"] + 1):
-                    if not current_map.get_tile(row, col_offset):
-                        current_map.set_tile(row, col_offset, " ", seen=False, visited=False)
-
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                world_row = player_world_row + dr
-                world_col = player_world_col + dc
-                existing = current_map.get_tile(world_row, world_col)
-                if existing and existing.terrain == ' ':
-                    current_map.mark_visited(world_row, world_col)
-                elif not existing:
-                    current_map.set_tile(world_row, world_col, ' ', seen=True, visited=True)
-
-        result["player_world_pos"] = [player_world_row, player_world_col]
         return result
 
+    def _session_alive(self) -> bool:
+        if self.session_name is None:
+            return False
+        return (
+            self._tmux("has-session", "-t", self.session_name, check=False).returncode
+            == 0
+        )
+
+    def _capture_screen(self) -> tuple[str, list[str]]:
+        if self.session_name is None:
+            raise RuntimeError("Game not started. Call start_game first.")
+        if not self._session_alive():
+            raise RuntimeError(f"tmux session '{self.session_name}' not found")
+        result = self._tmux("capture-pane", "-t", self.session_name, "-p", "-J")
+        text = self._strip_ansi(result.stdout)
+        return text, text.split("\n")
+
+    def _send_keys(self, *keys: str) -> None:
+        self._tmux("send-keys", "-t", self.session_name, *keys)
+
+    def _type(self, text: str) -> None:
+        """Send literal text (never interpreted as tmux key names)."""
+        self._tmux("send-keys", "-t", self.session_name, "-l", text)
+
+    #: the game is waiting for an answer; a keypress replies, it does not move
+    PROMPT_MARKERS = (
+        "[ynq]",
+        "[y/n]",
+        "[na]",
+        "[aq]",
+        "Do you want",
+        "Do you wish",
+        "What do",
+        "In what direction",
+        "Really",
+        "Replace",
+        "How many",
+        "Which",
+        "Unlock it",
+    )
+
+    def _open_prompt(self, screen_lines: list[str]) -> str:
+        """The question on the message line, if the game awaits an answer."""
+        window = self._map_window(screen_lines)
+        top = window[0] if window else 1
+        message = " ".join(line.strip() for line in screen_lines[: max(top, 1)]).strip()
+        if not message or "--More--" in message:
+            return ""
+        if any(marker in message for marker in self.PROMPT_MARKERS):
+            return message
+        if message.endswith(("?", "]")):
+            return message
+        return ""
+
+    def _drain_more(self, screen_lines: list[str], limit: int = 15) -> list[str]:
+        """Page through pending messages so the real command lands.
+
+        Letters do not dismiss ``--More--`` in this build - only Space does, so
+        sending a movement key while the pager is up loses the key entirely.
+        """
+        cleared: list[str] = []
+        for _ in range(limit):
+            joined = "\n".join(screen_lines)
+            if "--More--" not in joined:
+                break
+            text = joined.split("--More--")[0].strip().split("\n")[-1].strip()
+            if text:
+                cleared.append(text)
+            self._send_keys("Space")
+            time.sleep(0.15)
+            _, screen_lines = self._capture_screen()
+        self.cleared_messages = cleared
+        return cleared
+
+    def _wait_until_stable(self, timeout: float = 2.0, settle: float = 0.25) -> list[str]:
+        """Capture until two consecutive screens agree (game stopped redrawing)."""
+        deadline = time.time() + timeout
+        previous: list[str] | None = None
+        while True:
+            _, lines = self._capture_screen()
+            if previous is not None and lines == previous:
+                return lines
+            previous = lines
+            if time.time() > deadline:
+                return lines
+            time.sleep(settle)
+
     # ------------------------------------------------------------------ #
-    #  Game lifecycle
+    #  screen parsing
     # ------------------------------------------------------------------ #
 
-    def start_game(self, character: str = "random") -> dict[str, Any]:
-        """Start a new NetHack game."""
-        session_name = self._get_session_name()
-        state_file = self._get_state_file()
+    @staticmethod
+    def _find_player(screen_lines: list[str]) -> tuple[int, int] | None:
+        for r, line in enumerate(screen_lines):
+            c = line.find("@")
+            if c >= 0:
+                return (r, c)
+        return None
 
+    @staticmethod
+    def _status_row(screen_lines: list[str]) -> int | None:
+        for r, line in enumerate(screen_lines):
+            if "Dlvl:" in line or re.search(r"\bSt:\d+\s+Dx:", line):
+                return r
+        return None
+
+    @classmethod
+    def _text_count(cls, line: str) -> int:
+        """Characters that are clearly prose rather than dungeon geometry."""
+        return sum(
+            1
+            for ch in line
+            if ch.isprintable()
+            and not ch.isspace()
+            and ch not in VISIBLE_TERRAIN
+            and ch not in "\"'`.,:;!@()$"
+        )
+
+    @classmethod
+    def _map_window(cls, screen_lines: list[str]) -> tuple[int, int] | None:
+        """Inclusive screen rows holding the dungeon map, or None when this
+        screen is not the map (menu, prompt, death screen...).
+
+        Row 0 is the message line, and a long message keeps writing on the rows
+        below it, so the map starts at the first row that is not prose.  The
+        window's height changes with the message, and because the map is
+        centred on the player the whole dungeon slides a row when a message
+        clears - which is why this must be detected and never assumed.
+        """
+        status = cls._status_row(screen_lines)
+        if status is None:
+            return None
+        first = 1
+        while first < status - 1 and cls._text_count(screen_lines[first]) >= 3:
+            first += 1
+        last = status - 1
+        if last < first:
+            return None
+        player = cls._find_player(screen_lines)
+        if player is None or not (first <= player[0] <= last):
+            return None
+        body = "".join(screen_lines[first : last + 1])
+        junk = sum(
+            1 for ch in body if ch not in VISIBLE_TERRAIN and not ch.isspace() and ch != "@"
+        )
+        if junk > 40:
+            return None  # a menu or prompt drawn over the map area
+        return (first, last)
+
+    @staticmethod
+    def _extract_level(screen_lines: list[str]) -> int | None:
+        for line in screen_lines:
+            match = re.search(r"Dlvl:\s*(\d+|[A-Za-z])", line)
+            if match:
+                value = match.group(1)
+                return int(value) if value.isdigit() else ord(value.upper()) - 64
+        return None
+
+    @staticmethod
+    def _is_new_game_screen(raw_text: str) -> bool:
+        markers = (
+            "Who are you?",
+            "Do you want your possessions identified?",
+            "Shall I pick",
+        )
+        return any(marker in raw_text for marker in markers)
+
+    # ------------------------------------------------------------------ #
+    #  map / position
+    # ------------------------------------------------------------------ #
+
+    def get_map(self) -> DungeonMap:
+        if self.current_level not in self.maps:
+            self.maps[self.current_level] = DungeonMap(level=self.current_level)
+        return self.maps[self.current_level]
+
+    def update_map(
+        self,
+        screen_lines: list[str],
+        expected_world: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
+        """Merge the current screen into the level map."""
+        window = self._map_window(screen_lines)
+        if window is None:
+            return {"updated": False, "reason": "no map window on screen"}
+        player = self._find_player(screen_lines)
+        assert player is not None
+        info = self.get_map().apply_screen(
+            screen_lines, player, window, expected_world=expected_world
+        )
+        info["updated"] = True
+        return info
+
+    def _note_move_result(
+        self,
+        command: str,
+        before_pos: tuple[int, int] | None,
+        before_lines: list[str],
+        after_pos: tuple[int, int] | None,
+    ) -> str | None:
+        """Reconcile a single-step move with the map; name what blocked us."""
+        if before_pos is None or after_pos is None or len(command) != 1:
+            return None
+        step = KEY_DIRS.get(command.lower())
+        if step is None or command.isupper():
+            return None
+        target = (before_pos[0] + step[0], before_pos[1] + step[1])
+        if after_pos != before_pos:
+            return None
+
+        # we did not move: find out what stopped us
+        dungeon_map = self.get_map()
+        offset = dungeon_map.dungeon_offset
+        srow, scol = target[0] - offset[0], target[1] - offset[1]
+        shown = (
+            before_lines[srow][scol]
+            if 0 <= srow < len(before_lines) and 0 <= scol < len(before_lines[srow])
+            else " "
+        )
+        tile = dungeon_map.get_tile(*target)
+        diagonal = step[0] != 0 and step[1] != 0
+        if shown == " ":
+            # blank while we were right next to it: confirmed rockwall
+            dungeon_map.mark_solid(*target)
+            reason = "solid rockwall, nothing was drawn there"
+        elif shown == DOOR or (tile is not None and tile.door_closed):
+            reason = f"shut door: open it with 'o{command}', or kick it ('^D')"
+        elif diagonal and (
+            (tile is not None and tile.doorway)
+            or dungeon_map.has_door_leaf(before_pos)
+        ):
+            reason = "NetHack refuses diagonals into or out of an intact doorway"
+        elif shown not in VISIBLE_TERRAIN and shown != "@":
+            reason = f"something is standing there ({shown})"
+        elif tile is not None and tile.terrain == CAVE:
+            # drawn '#' and it stopped us: not a corridor after all
+            dungeon_map.mark_solid(*target)
+            reason = "'#' that will not pass: iron bars, a tree or a raised drawbridge"
+        elif tile is not None and tile.terrain == LIQUID:
+            reason = "water or lava"
+        elif tile is not None and not tile.passable:
+            reason = f"{tile.terrain} wall"
+        else:
+            reason = "blocked"
+        return f"blocked heading {command} -> ({target[0]},{target[1]}): {reason}"
+
+    # ------------------------------------------------------------------ #
+    #  lifecycle
+    # ------------------------------------------------------------------ #
+
+    def start_game(self, character: str = "Hero") -> dict[str, Any]:
+        """Start a fresh NetHack game in a dedicated tmux session."""
+        session_name = self._new_session_name()
+        state_file = self._new_state_file()
         self.stop_game()
 
         cmd = [
-            "tmux",
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-x",
-            "80",
-            "-y",
-            "24",
-            "bash",
-            "-c",
-            'export NETHACKOPTIONS="color"; while true; do nethack; sleep 1; done',
+            "tmux", "new-session", "-d", "-s", session_name,
+            "-x", "80", "-y", "24",
+            "bash", "-c",
+            'export NETHACKOPTIONS="color"; exec nethack -d /var/games/nethack',
         ]
-
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            return {"error": f"Failed to start tmux session: {e}", "status": "error"}
-
-        time.sleep(2)
-
-        check_result = subprocess.run(
-            ["tmux", "has-session", "-t", session_name],
-            capture_output=True,
-            text=True,
-        )
-        if check_result.returncode != 0:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
             return {
-                "error": f"tmux session '{session_name}' was not created. Is NetHack installed and in PATH?",
                 "status": "error",
+                "error": f"Failed to start tmux session: {exc.stderr or exc}",
             }
-
-        state = {
-            "status": "started",
-            "screen": "",
-            "full_output": "",
-            "message": "Game started. Waiting for character selection...",
-            "session_name": session_name,
-            "state_file": state_file,
-        }
-
-        try:
-            with open(state_file, "w") as f:
-                json.dump(state, f)
-        except Exception as e:
-            self.stop_game()
-            return {"error": f"Failed to write state file: {e}", "status": "error"}
 
         self.session_name = session_name
         self.state_file = state_file
-        self.game_state = state
+        self.maps = {}
+        self.current_level = 1
+        self.current_goal = "Explore the level"
+        self.previous_screen = None
 
-        time.sleep(0.5)
+        try:
+            self._wait_until_stable(timeout=6.0)
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
+
+        # answer the intro prompts so the caller lands in the dungeon
+        for _ in range(8):
+            raw, lines = self._capture_screen()
+            if self._map_window(lines) is not None and not self._is_new_game_screen(raw):
+                break
+            if "Who are you?" in raw:
+                self._type(character)
+                self._send_keys("Enter")
+            elif "Do you want your possessions identified?" in raw:
+                self._send_keys("n")
+            elif "Shall I pick" in raw:
+                self._type("random")
+                self._send_keys("Enter")
+            elif "Hit return" in raw or "to continue" in raw:
+                self._send_keys("Enter")
+            elif "Ready to play" in raw:
+                self._send_keys("y")
+            elif "--More--" in raw:
+                self._send_keys("Enter")
+            else:
+                break
+            time.sleep(1.0)
+
+        # start memory from a clean frame: the map window shifts a row whenever
+        # a message clears, and an origin taken mid-prompt would be off by one
+        self.maps = {}
         state = self.get_state()
         state["status"] = "started"
-        state["message"] = "Game started. Waiting for character selection..."
+        state["session_name"] = session_name
+        self._persist_state(state)
         return state
 
     def send_command(self, command: str) -> dict[str, Any]:
-        """Send a command to NetHack."""
+        """Send keystrokes to NetHack and return the resulting state."""
         if self.session_name is None:
-            return {"error": "Game not started. Call start_game first.", "status": "error"}
-
-        current_state = self.get_state()
-        full_output = current_state.get("full_output", "")
-        self.previous_screen = full_output
-        self.previous_stripped_screen = full_output.split("\n")
+            return {"status": "error", "error": "Game not started. Call start_game first."}
+        if not command:
+            return {"status": "error", "error": "Empty command"}
 
         try:
-            if command in _SPECIAL_KEYS:
-                tmux_key = _SPECIAL_KEYS[command]
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", self.session_name, tmux_key],
-                    check=True,
-                    capture_output=True,
-                )
+            _, before_lines = self._capture_screen()
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
+        self.previous_screen = "\n".join(before_lines)
+        before_map = self.maps.get(self.current_level)
+        before_pos = before_map.player_world_pos if before_map else None
+
+        # A paused message pager swallows whatever key you send it, so clear it
+        # first and keep the text we skimmed past.
+        cleared = self._drain_more(before_lines)
+        if cleared:
+            _, before_lines = self._capture_screen()
+
+        paused = bool(self._open_prompt(before_lines))
+        expected_world = None
+        if not paused and before_pos is not None and len(command) == 1:
+            step = KEY_DIRS.get(command.lower())
+            if step is not None and not command.isupper():
+                expected_world = (before_pos[0] + step[0], before_pos[1] + step[1])
+
+        try:
+            if command in _NAMED_KEYS:
+                self._send_keys(_NAMED_KEYS[command])
+            elif command.startswith("#"):
+                # NetHack extended commands are M-x <name> <ret>
+                self._send_keys("Escape", "x")
+                self._type(command.lstrip("#"))
+                self._send_keys("Enter")
             else:
-                for char in command:
-                    subprocess.run(
-                        ["tmux", "send-keys", "-t", self.session_name, char],
-                        check=True,
-                        capture_output=True,
-                    )
-                if command.startswith("#"):
-                    subprocess.run(
-                        ["tmux", "send-keys", "-t", self.session_name, "Enter"],
-                        check=True,
-                        capture_output=True,
-                    )
+                self._type(command)
+        except subprocess.CalledProcessError as exc:
+            return {"status": "error", "error": f"Failed to send command: {exc}"}
 
-            time.sleep(1.0)
+        try:
+            self._wait_until_stable(timeout=3.0)
+            state = self.get_state(expected_world=expected_world)
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
 
-            state = self.get_state()
-
-            if self.state_file:
-                try:
-                    with open(self.state_file, "r") as f:
-                        saved_state = json.load(f)
-                    saved_state["previous_screen"] = self.previous_screen
-                    saved_state["previous_stripped_screen"] = self.previous_stripped_screen
-                    with open(self.state_file, "w") as f:
-                        json.dump(saved_state, f)
-                except Exception as exc:
-                    _log_error("send_command: saving previous screen", exc)
-
-            if self.previous_stripped_screen is not None:
-                current_stripped = state.get("full_output", "").split("\n")
-                if len(current_stripped) > 0 and current_stripped[0] != "":
-                    diff = self._create_diff(current_stripped, self.previous_stripped_screen)
-                    state["diff"] = diff
-
-            return state
-
-        except subprocess.CalledProcessError as e:
-            return {"error": f"Failed to send command: {e}", "status": "error"}
+        prompt = self._open_prompt(before_lines)
+        after_map = self.maps.get(self.current_level)
+        after_pos = after_map.player_world_pos if after_map else None
+        notes = []
+        if self.cleared_messages:
+            notes.append(
+                "cleared {} waiting message(s): {}".format(
+                    len(self.cleared_messages),
+                    "; ".join(dict.fromkeys(self.cleared_messages)),
+                )
+            )
+        if prompt:
+            notes.append(
+                f"the game is asking {prompt!r} - your key answered that, it did not move you"
+            )
+        else:
+            note = self._note_move_result(command, before_pos, before_lines, after_pos)
+            if note:
+                notes.append(note)
+        if notes:
+            state["move_result"] = "\n".join(notes)
+        state["diff"] = self._create_diff(
+            state.get("screen_lines", []), self.previous_screen.split("\n")
+        )
+        self.previous_screen = "\n".join(state.get("screen_lines", []))
+        self._persist_state(state)
+        return state
 
     def stop_game(self) -> dict[str, Any]:
-        """Stop the current game."""
-        if self.session_name is None:
-            return {"status": "stopped", "message": "No game running"}
-
-        try:
-            subprocess.run(
-                ["tmux", "send-keys", "-t", self.session_name, "#quit"],
-                check=False,
-                capture_output=True,
-            )
-            time.sleep(0.5)
-            subprocess.run(
-                ["tmux", "send-keys", "-t", self.session_name, "Enter"],
-                check=False,
-                capture_output=True,
-            )
-            time.sleep(0.5)
-        except Exception:
-            pass
-
-        try:
-            subprocess.run(
-                ["tmux", "kill-session", "-t", self.session_name],
-                check=False,
-                capture_output=True,
-            )
-        except Exception:
-            pass
-
+        """Kill the tmux session and forget this game."""
+        if self.session_name is not None:
+            try:
+                if self._session_alive():
+                    self._tmux("kill-session", "-t", self.session_name, check=False)
+            except Exception as exc:  # pragma: no cover - defensive
+                _log_error("stop_game: killing session", exc)
         try:
             if self.state_file and os.path.exists(self.state_file):
                 os.remove(self.state_file)
-        except Exception as exc:
+        except Exception as exc:  # pragma: no cover - defensive
             _log_error("stop_game: removing state file", exc)
-
-        for sf in self._find_all_state_files():
-            try:
-                if os.path.exists(sf):
-                    os.remove(sf)
-            except Exception as exc:
-                _log_error("stop_game: removing old state file", exc)
 
         self.session_name = None
         self.state_file = None
-        self.current_goal = "Explore questionmarks"
-        self.goal_counter = 0
-        self.goal_locked_until_counter = -1
+        self.current_goal = ""
         self.current_level = 1
         self.maps = {}
         self.previous_screen = None
-        self.previous_stripped_screen = None
         self.game_state = {}
-
-        return {"status": "stopped", "message": "Game stopped successfully"}
+        return {"status": "stopped", "message": "Game stopped"}
 
     # ------------------------------------------------------------------ #
-    #  State / screen
+    #  state / output
     # ------------------------------------------------------------------ #
 
-    def _capture_screen(self) -> tuple[str, list[str]]:
-        """Capture the current tmux pane and return (raw_text, stripped_lines)."""
-        if self.session_name is None:
-            raise RuntimeError("Game not started")
-
-        check_result = subprocess.run(
-            ["tmux", "has-session", "-t", self.session_name],
-            capture_output=True,
-            text=True,
+    def _create_diff(self, current: list[str], previous: list[str]) -> str:
+        if not previous:
+            return ""
+        max_lines = max(len(current), len(previous))
+        max_width = max(
+            (max((len(l) for l in current), default=0)),
+            (max((len(l) for l in previous), default=0)),
         )
-        if check_result.returncode != 0:
-            raise RuntimeError(f"tmux session '{self.session_name}' not found")
+        lines = []
+        for row in range(max_lines):
+            cur = current[row] if row < len(current) else ""
+            old = previous[row] if row < len(previous) else ""
+            changed = "".join(
+                (cur[col] if col < len(cur) else " ")
+                if (cur[col] if col < len(cur) else " ")
+                != (old[col] if col < len(old) else " ")
+                else " "
+                for col in range(max_width)
+            ).rstrip()
+            if changed:
+                lines.append(f"{row:2d}|{changed}")
+        return "\n".join(lines)
 
-        time.sleep(0.2)
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-t", self.session_name, "-p", "-J"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    def _describe_position(self, dungeon_map: DungeonMap) -> str:
+        pos = dungeon_map.player_world_pos
+        if pos is None:
+            return "unknown position"
+        row, col = pos
+        tile = dungeon_map.get_tile(row, col)
+        terrain = tile.terrain if tile else None
+        names = {
+            ".": "floor",
+            "#": "cave floor",
+            "+": "doorway",
+            "<": "stairs up",
+            ">": "stairs down",
+        }
+        where = names.get(terrain or "", "unrecognised tile")
+        if tile is not None and tile.doorway:
+            where = "open doorway" if tile.door_open else "shut doorway"
+        if tile is not None and tile.trap:
+            where += " on a spotted TRAP"
+        room = dungeon_map.room_at(row, col)
+        suffix = f", in room {room.id}" if room else ""
+        return f"world ({row},{col}) on {where}{suffix}"
 
-        stripped_text, _ = self._strip_ansi(result.stdout)
-        screen_lines = stripped_text.split("\n")
-        return result.stdout, screen_lines
-
-    def _build_hints(
-        self, screen_lines: list[str], player_row: int, player_col: int
-    ) -> tuple[str, dict[str, str]]:
-        """Build directional hints and allowed-move list."""
-        direction_tiles: dict[str, str] = {}
-        for key, (dr, dc) in _DIRECTION_OFFSETS.items():
-            r, c = player_row + dr, player_col + dc
-            if 0 <= r < len(screen_lines) and 0 <= c < len(screen_lines[r]):
-                direction_tiles[key] = screen_lines[r][c]
+    def _neighbour_hints(self, screen_lines: list[str]) -> str:
+        """What the eight tiles around the player are, live and remembered."""
+        player = self._find_player(screen_lines)
+        dungeon_map = self.maps.get(self.current_level)
+        if player is None or dungeon_map is None:
+            return ""
+        prow, pcol = player
+        lines = []
+        for step, key in DIR_KEYS.items():
+            r, c = prow + step[0], pcol + step[1]
+            on_screen = (
+                screen_lines[r][c]
+                if 0 <= r < len(screen_lines) and 0 <= c < len(screen_lines[r])
+                else " "
+            )
+            world = (dungeon_map.dungeon_offset[0] + r, dungeon_map.dungeon_offset[1] + c)
+            tile = dungeon_map.get_tile(*world)
+            diagonal = step[0] != 0 and step[1] != 0
+            if tile is not None and tile.solid:
+                known, walkable = "X", "solid: you cannot walk here"
+            elif tile is not None and tile.doorway:
+                if tile.door_closed:
+                    known, walkable = "+", f"door SHUT: 'o{key}' opens it"
+                else:
+                    known, walkable = "'", "doorway open: walk through"
+            elif tile is not None and tile.memory:
+                known = f"{tile.terrain} remembered"
+                walkable = "walkable" if tile.passable else "wall"
+            elif world in dungeon_map.frontier():
+                known, walkable = "?", "UNREVEALED (maybe cave floor)"
             else:
-                direction_tiles[key] = " "
+                known, walkable = " ", "unknown"
+            if tile is not None and tile.trap and walkable.startswith("walkable"):
+                walkable += " but a TRAP is on it"
+            if tile is not None and tile.terrain == LIQUID:
+                walkable = "water/lava: you would swim"
+            if diagonal and tile is not None and tile.doorway:
+                walkable += " and no diagonal entry"
+            live = "" if on_screen == key else f" screen shows '{on_screen}'"
+            lines.append(f"`{key}` {known:<12} {walkable}{live}")
+        return "\n".join(lines)
 
-        current_map = self.maps.get(self.current_level)
+    def _frontier_report(self, summary: dict[str, Any], limit: int = 6) -> str:
+        groups = summary.get("frontier_targets") or []
+        if not summary.get("frontier_areas"):
+            return "none - everything within reach is remembered"
+        lines = [
+            "{} unrevealed reachable cell(s) in {} area(s):".format(
+                summary.get("frontier_cells", 0), summary.get("frontier_areas", 0)
+            )
+        ]
+        for index, group in enumerate(groups[:limit], start=1):
+            stand_r, stand_c = group["stand"]
+            probe = group.get("probe") or ""
+            door = group.get("door_ahead")
+            walk = group["route"] or "(you are there)"
+            verb = f"open it with `{probe}`" if door else f"poke with `{probe}`"
+            where = (
+                f"beyond the door at ({door[0]},{door[1]})"
+                if door
+                else f"next to ({stand_r},{stand_c})"
+            )
+            notes = []
+            if group.get("door_shut"):
+                notes.append("shut door: 'o'+direction, or kick it ('^D')")
+            elif group.get("through_door") and not door:
+                notes.append("a door on the way: it may be locked")
+            if group.get("trap_on_route"):
+                notes.append("a TRAP is on the way")
+            if group.get("on_stairs"):
+                notes.append("stairs")
+            tag = f" [{'; '.join(notes)}]" if notes else ""
+            lines.append(
+                f"{index}. {group['cells']} cell(s) {where}, "
+                f"{group['steps']} step(s): {walk}, {verb}{tag}"
+            )
+        if len(groups) > limit:
+            lines.append(f"... {len(groups) - limit} more, further away")
+        return "\n".join(lines)
 
-        hints_lines = ["HINTS", ""]
-        for key in "hjklynub":
-            tile = direction_tiles.get(key, " ")
-            map_info = ""
-
-            if current_map and current_map.player_world_pos:
-                row_offset, col_offset = _DIRECTION_OFFSETS.get(key, (0, 0))
-                direction_row = player_row + row_offset
-                direction_col = player_col + col_offset
-                world_row = current_map.dungeon_offset[0] + direction_row
-                world_col = current_map.dungeon_offset[1] + direction_col
-                tile_obj = current_map.get_tile(world_row, world_col)
-                if tile_obj:
-                    visited_str = " (VISITED)" if tile_obj.visited else " (UNVISITED)"
-                    map_info = visited_str
-                    if tile in ("|", "-") and current_map._is_terrain_passable(
-                        world_row, world_col
-                    ):
-                        tile = "+"
-                    if tile == " " and tile_obj.visited:
-                        tile = "X"
-                        map_info = " IMPASSABLE"
-            hints_lines.append(f"`{key}`:{tile}{map_info}")
-
-        
-        if self.current_goal:
-            hints_lines.append(f"Goal: {self.current_goal}")
-
-        return "\n".join(hints_lines), direction_tiles
-
-    def _persist_state(self, state: dict[str, Any]) -> None:
-        """Write full state to the state file for later restoration."""
-        if not self.state_file:
-            return
-
-        maps_data = {str(level): map_obj.to_dict() for level, map_obj in self.maps.items()}
-
-        state["state_file"] = self.state_file
-        state["current_goal"] = self.current_goal
-        state["goal_counter"] = self.goal_counter
-        state["goal_locked_until_counter"] = self.goal_locked_until_counter
-        state["maps"] = maps_data
-        state["current_level"] = self.current_level
-
-        current_map = self.maps.get(self.current_level)
-        if current_map and current_map.player_world_pos:
-            state["player_world_pos"] = list(current_map.player_world_pos)
-
-        state["previous_screen"] = self.previous_screen
-        state["previous_stripped_screen"] = self.previous_stripped_screen
-
-        try:
-            with open(self.state_file, "w") as f:
-                json.dump(state, f)
-        except Exception as exc:
-            _log_error("_persist_state", exc)
-
-    def get_state(self) -> dict[str, Any]:
-        """Get current game state from tmux."""
-        if self.session_name is None:
-            return {"error": "Game not started. Call start_game first.", "status": "error"}
-
-        try:
-            raw_text, screen_lines = self._capture_screen()
-        except RuntimeError as e:
-            return {"error": str(e), "status": "error"}
-        except subprocess.CalledProcessError as e:
-            return {"error": f"Failed to capture screen: {e}", "status": "error"}
+    def get_state(self, expected_world: tuple[int, int] | None = None) -> dict[str, Any]:
+        """Full game state: screen, map memory, frontier, hints."""
+        raw_text, screen_lines = self._capture_screen()
 
         if self._is_new_game_screen(raw_text):
             self.maps = {}
-            self.current_level = 1
 
-        player_pos = self._find_player(screen_lines)
-
-        new_level = self._extract_level_from_status(screen_lines)
+        new_level = self._extract_level(screen_lines)
         if new_level is not None and new_level != self.current_level:
             self.current_level = new_level
 
-        if player_pos is not None and "--More--" not in raw_text:
-            player_row, player_col = player_pos
-            self._update_map_from_screen(screen_lines, player_row, player_col)
+        info = self.update_map(screen_lines, expected_world=expected_world)
+        dungeon_map = self.maps.get(self.current_level)
+        if info.get("conflicts"):
+            state_warning = (
+                f"{info['conflicts']} screen tile(s) contradicted memory - the map "
+                f"may be misaligned (alignment {info.get('alignment')})"
+            )
+        else:
+            state_warning = ""
 
-        self.previous_stripped_screen = screen_lines.copy()
-
-        current_map = self.maps.get(self.current_level)
         state: dict[str, Any] = {
             "status": "playing",
-            "screen": raw_text,
-            "full_output": raw_text,
+            "screen": raw_text.rstrip("\n"),
+            "screen_lines": screen_lines,
             "session_name": self.session_name,
-            "map": {
-                "level": self.current_level,
-                "player_world_pos": current_map.player_world_pos if current_map else None,
-                "explored_tiles": current_map.get_explored_count() if current_map else 0,
-                "seen_tiles": current_map.get_seen_count() if current_map else 0,
-                "bounds": current_map.bounds
-                if current_map
-                else {"min_row": 0, "max_row": 0, "min_col": 0, "max_col": 0},
-            },
+            "level": self.current_level,
+            "map_updated": info.get("updated", False),
         }
-
-        if self.previous_stripped_screen is not None:
-            state["diff"] = self._create_diff(screen_lines, self.previous_stripped_screen)
-
-        if self.current_goal:
-            state["screen"] = f"Goal: {self.current_goal}\n\n{raw_text}"
-
-        if player_pos is not None:
-            player_row, player_col = player_pos
-            hints_text, direction_tiles = self._build_hints(screen_lines, player_row, player_col)
-            state["hints"] = hints_text
-            state["direction_tiles"] = direction_tiles
-
-            if current_map:
-                map_result = self._show_map()
-                if map_result.get("status") == "success":
-                    map_str = map_result.get("map", "")
-                    pw_row, pw_col = current_map.player_world_pos
-                    player_tile = current_map.get_tile(pw_row, pw_col)
-                    if player_tile:
-                        terrain_char = player_tile.terrain
-                    else:
-                        terrain_char = "unknown"
-                    
-                    description = self._describe_terrain(terrain_char, pw_row, pw_col, current_map)
-                    
-                    room_id = current_map._get_room_at(pw_row, pw_col)
-                    if room_id is not None:
-                        rel_pos = current_map._get_room_relative_pos(pw_row, pw_col, room_id)
-                        room_name = f"Room {room_id}"
-                        description += f" (in {room_name}, {rel_pos[0]:.0%} down, {rel_pos[1]:.0%} right from room origin)"
-                    
-                    state["hints"] = hints_text + "\n\n###### MAP ######\n" + map_str + "\n\n" \
-                                    f"Player Position: World ({pw_row}, {pw_col}) - Standing on {description}"
+        if state_warning:
+            state["map_warning"] = state_warning
+        if dungeon_map is not None:
+            summary = dungeon_map.describe()
+            state["player_world_pos"] = summary["player_world_pos"]
+            state["map_summary"] = summary
+            hints = []
+            if self.current_goal:
+                hints.append(f"Goal: {self.current_goal}")
+            neighbours = self._neighbour_hints(screen_lines)
+            if neighbours:
+                hints.append("NEIGHBOURS\n" + neighbours)
+            hints.append(f"YOU ARE: {self._describe_position(dungeon_map)}")
+            state["hints"] = "\n\n".join(hints)
+            state["map"] = dungeon_map.render()
+            state["frontier"] = self._frontier_report(summary)
 
         if "--More--" in raw_text:
-            state["screen"] = state["screen"] + '\nSend literal string "Enter" to continue beyond --More--'
+            state["prompt"] = (
+                "messages are waiting behind --More--; a 'nethack_move' clears them "
+                "automatically before your command runs"
+            )
+        else:
+            open_prompt = self._open_prompt(screen_lines)
+            if open_prompt:
+                state["prompt"] = f"the game is waiting for an answer: {open_prompt}"
 
-        self._persist_state(state)
         self.game_state = state
         return state
 
-    def _show_map(self) -> dict[str, Any]:
-        """Generate a string representation of the current map."""
-        if self.current_level not in self.maps:
-            return {"error": f"No map data for level {self.current_level}", "status": "error"}
-
-        current_map = self.maps[self.current_level]
-        map_string = current_map.get_map_string()
-
+    def map_payload(self) -> dict[str, Any]:
+        """Map-only payload (no screen capture)."""
+        dungeon_map = self.maps.get(self.current_level)
+        if dungeon_map is None:
+            return {"status": "error", "error": f"no map for level {self.current_level}"}
+        summary = dungeon_map.describe()
         return {
-            "map": map_string,
-            "level": self.current_level,
-            "bounds": current_map.bounds,
-            "explored_tiles": current_map.get_explored_count(),
-            "seen_tiles": current_map.get_seen_count(),
-            "player_world_pos": current_map.player_world_pos,
-            "downstairs_pos": current_map.downstairs_pos,
             "status": "success",
+            "level": self.current_level,
+            "map": dungeon_map.render(),
+            "frontier": self._frontier_report(summary),
+            "summary": summary,
+            "player": self._describe_position(dungeon_map),
         }
 
+    # ------------------------------------------------------------------ #
+    #  persistence (survives a server restart while the game keeps running)
+    # ------------------------------------------------------------------ #
 
-# ------------------------------------------------------------------ #
-#  MCP server
-# ------------------------------------------------------------------ #
+    def _new_session_name(self) -> str:
+        import random
+        import string
 
-server = Server("nethack-mcp", version="0.1.0", instructions=SERVER_INSTRUCTIONS)
+        suffix = "".join(random.choices(string.ascii_lowercase, k=8))
+        return f"{self.TMUX_SESSION_PREFIX}{suffix}"
+
+    def _new_state_file(self) -> str:
+        import random
+        import string
+
+        suffix = "".join(random.choices(string.ascii_lowercase, k=8))
+        return f"{self.STATE_FILE_PREFIX}{suffix}.json"
+
+    def _persist_state(self, state: dict[str, Any]) -> None:
+        if not self.state_file:
+            return
+        payload = {
+            "session_name": self.session_name,
+            "state_file": self.state_file,
+            "current_goal": self.current_goal,
+            "current_level": self.current_level,
+            "player_world_pos": state.get("player_world_pos"),
+            "maps": {str(level): m.to_dict() for level, m in self.maps.items()},
+            "previous_screen": self.previous_screen,
+        }
+        try:
+            with open(self.state_file, "w") as handle:
+                json.dump(payload, handle)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log_error("_persist_state", exc)
+
+    def _restore_state(self) -> None:
+        import glob
+
+        files = sorted(glob.glob(f"{self.STATE_FILE_PREFIX}*.json"))
+        if not files:
+            return
+        try:
+            with open(files[0]) as handle:
+                state = json.load(handle)
+        except Exception as exc:
+            _log_error("_restore_state: reading", exc)
+            return
+
+        session = state.get("session_name")
+        if not session:
+            return
+        self.session_name = session
+        self.state_file = files[0]
+        self.current_goal = state.get("current_goal", "")
+        self.current_level = int(state.get("current_level", 1))
+        self.previous_screen = state.get("previous_screen")
+        for level_str, map_data in (state.get("maps") or {}).items():
+            try:
+                self.maps[int(level_str)] = DungeonMap.from_dict(map_data)
+            except Exception as exc:
+                _log_error("_restore_state: map level", exc)
+
+        if not self._session_alive():
+            # the game died but the memory may still be useful
+            print(
+                f"[INFO] restored state for dead tmux session {session}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+# ---------------------------------------------------------------------- #
+#  MCP plumbing
+# ---------------------------------------------------------------------- #
+
+server = Server("nethack-mcp", version="0.2.0", instructions=SERVER_INSTRUCTIONS)
+_client: NetHackClient | None = None
 _fullscreen = False
 
 
-def _show_fullscreen(screen: str, hints: str) -> None:
-    """Clear terminal and print screen + map."""
-    map_start = hints.find("###### MAP ######")
-    if map_start != -1:
-        map_part = hints[map_start + len("###### MAP ######"):].strip()
-        hints_part = hints[:map_start].strip()
-    else:
-        map_part = hints[hints.rfind("\n"):].strip() if hints else ""
-        hints_part = hints
+def get_client() -> NetHackClient:
+    """One client per server process; the game lives in tmux anyway."""
+    global _client
+    if _client is None:
+        _client = NetHackClient()
+    return _client
 
-    sys.stdout.write("\033[H\033[J")
-    sys.stdout.write(screen)
-    if hints_part:
-        sys.stdout.write(f"\n{hints_part}\n")
-    if map_part:
-        sys.stdout.write(f"\n{map_part}\n")
-    sys.stdout.flush()
 
-_fullscreenclear: asyncio.Event | None = None
+def _format_state(state: dict[str, Any]) -> str:
+    if state.get("status") == "error":
+        return f"ERROR: {state.get('error')}"
+    parts = ["=== SCREEN ===", state.get("screen", "")]
+    if state.get("move_result"):
+        parts += ["", "=== MOVE ===", state["move_result"]]
+    if state.get("map_warning"):
+        parts += ["", f"WARNING: {state['map_warning']}"]
+    if state.get("hints"):
+        parts += ["", state["hints"]]
+    if state.get("map"):
+        parts += [
+            "",
+            f"=== MAP (level {state.get('level')}) ===",
+            state["map"].rstrip("\n"),
+        ]
+    if state.get("frontier"):
+        parts += ["", "=== FRONTIER (?) ===", state["frontier"]]
+    summary = state.get("map_summary") or {}
+    if summary:
+        parts += [
+            "",
+            "remembered {r} tiles, visited {v}, {f} unrevealed reachable cells; "
+            "stairs down {d}".format(
+                r=summary.get("remembered_tiles", 0),
+                v=summary.get("visited_tiles", 0),
+                f=summary.get("frontier_cells", 0),
+                d=tuple(summary["downstairs"]) if summary.get("downstairs") else "not seen",
+            ),
+        ]
+    if state.get("prompt"):
+        parts += ["", f"NOTE: {state['prompt']}"]
+    if state.get("diff"):
+        parts += ["", "=== DIFF ===", state["diff"]]
+    return "\n".join(parts)
+
+
+def _tool(text: str) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=text)]
 
 
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    """List available NetHack tools."""
+    def tool(name: str, description: str, props: dict[str, Any] | None = None, required: list[str] | None = None) -> types.Tool:
+        return types.Tool(
+            name=name,
+            description=description,
+            inputSchema={
+                "type": "object",
+                "properties": props or {},
+                "required": required or [],
+            },
+        )
+
     return [
-        types.Tool(
-            name="nethack_start",
-            description="Start a new NetHack game",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "character": {
-                        "type": "string",
-                        "description": "Character name (optional, defaults to random)",
-                    }
-                },
-                "required": [],
+        tool(
+            "nethack_start",
+            "Start a new NetHack game (answers the character-name prompts for you)",
+            {
+                "character": {
+                    "type": "string",
+                    "description": "Character name, default 'Hero'",
+                }
             },
         ),
-        types.Tool(
-            name="nethack_move",
-            description="Send a move/command to NetHack",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Command to send (movement keys, actions, or extended commands)",
-                    }
-                },
-                "required": ["command"],
+        tool(
+            "nethack_move",
+            "Send keystrokes to NetHack and return the screen, memory map and frontier. "
+            "vi-keys: h j k l y u b n (uppercase to run), '.' wait, ',' pick up, ':' look.",
+            {
+                "command": {
+                    "type": "string",
+                    "description": "Keystrokes, e.g. 'h', 'jj', 'mh', 'Enter', '#inventory'",
+                }
             },
+            ["command"],
         ),
-        types.Tool(
-            name="nethack_state",
-            description="Get current game state",
-            inputSchema={"type": "object", "properties": {}},
+        tool(
+            "nethack_state",
+            "Current screen, memory map, frontier and hints",
         ),
-        types.Tool(
-            name="nethack_stop",
-            description="Stop current NetHack game",
-            inputSchema={"type": "object", "properties": {}},
+        tool(
+            "nethack_map",
+            "Just the memory map of the current level, its frontier targets and rooms",
         ),
-        types.Tool(
-            name="nethack_set_goal",
-            description="Set the current goal for the AI player",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "goal": {
-                        "type": "string",
-                        "description": "The goal to set (e.g., 'Find stairs down', 'Eat food', 'Kill monster')",
-                    }
-                },
-                "required": ["goal"],
-            },
+        tool(
+            "nethack_diff",
+            "Characters that changed on screen since the previous call",
         ),
-        types.Tool(
-            name="nethack_diff",
-            description="Get the difference between current and previous screen",
-            inputSchema={"type": "object", "properties": {}},
+        tool(
+            "nethack_set_goal",
+            "Record what you are currently trying to do (shown with every state)",
+            {"goal": {"type": "string", "description": "Free-form goal text"}},
+            ["goal"],
         ),
+        tool("nethack_stop", "Stop the game and discard the maps"),
     ]
 
 
 @server.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict[str, Any]
-) -> list[types.TextContent]:
-    """Call a NetHack tool."""
-    print(f"[AI CALL] Tool: {name}, Arguments: {json.dumps(arguments)}", file=sys.stderr, flush=True)
-
-    client = NetHackClient()
-
+async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    client = get_client()
     try:
         if name == "nethack_start":
-            character = arguments.get("character", "human")
-            result = await asyncio.to_thread(client.start_game, character)
-            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-            screen_output = result.get("screen", result.get("message", ""))
-            text_output = screen_output if screen_output else json.dumps(result, indent=2)
-            return [types.TextContent(type="text", text=f"```\n{text_output}\n```")]
+            character = arguments.get("character") or "Hero"
+            state = await asyncio.to_thread(client.start_game, character)
+            return _tool(_format_state(state))
 
-        elif name == "nethack_move":
+        if name == "nethack_move":
             command = arguments.get("command")
             if not command:
-                return [
-                    types.TextContent(
-                        type="text", text="```\nERROR: Command is required\n```"
-                    )
-                ]
-            result = await asyncio.to_thread(client.send_command, command)
-
-            if isinstance(result, dict) and result.get("status") == "playing":
-                client.goal_counter += 1
-                if client.state_file:
-                    try:
-                        with open(client.state_file, "r") as f:
-                            state = json.load(f)
-                        state["goal_counter"] = client.goal_counter
-                        with open(client.state_file, "w") as f:
-                            json.dump(state, f)
-                    except Exception as exc:
-                        _log_error("nethack_move: saving goal counter", exc)
-
-            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-            screen_output = result.get("screen", "")
-            hints = result.get("hints", "")
-            diff = result.get("diff", "")
-
+                return _tool("ERROR: 'command' is required")
+            state = await asyncio.to_thread(client.send_command, command)
             if _fullscreen:
-                _show_fullscreen(screen_output, hints)
+                _show_fullscreen(state)
+            return _tool(_format_state(state))
 
-            output = screen_output if screen_output else json.dumps(result, indent=2)
-            if hints:
-                output = output + "\n" + hints
-            if diff:
-                output = output + f"\n\n=== DIFF ===\n{diff}"
-            return [types.TextContent(type="text", text=f"```\n{output}\n```")]
-
-        elif name == "nethack_state":
+        if name == "nethack_state":
             state = await asyncio.to_thread(client.get_state)
-            print(f"[AI CALL RESULT] {name}: {json.dumps(state)}", file=sys.stderr, flush=True)
-            screen_output = state.get("screen", "")
-            hints = state.get("hints", "")
-            output = screen_output if screen_output else json.dumps(state, indent=2)
-            if hints:
-                output = output + "\n" + hints
-            return [types.TextContent(type="text", text=f"```\n{output}\n```")]
+            return _tool(_format_state(state))
 
-        elif name == "nethack_stop":
-            result = await asyncio.to_thread(client.stop_game)
-            print(f"[AI CALL RESULT] {name}: {json.dumps(result)}", file=sys.stderr, flush=True)
-            return [types.TextContent(type="text", text=f"```\n{result}\n```")]
-
-        elif name == "nethack_set_goal":
-            goal = arguments.get("goal", "")
-
-            if "stair" in goal.lower():
-                return [
-                    types.TextContent(
-                        type="text",
-                        text=f"```\nERROR: Will not set goal to '{goal}'. Choose lower level objectives!\n```",
-                    )
-                ]
-
-            if client.goal_locked_until_counter > client.goal_counter:
-                remaining = client.goal_locked_until_counter - client.goal_counter
-                return [
-                    types.TextContent(
-                        type="text",
-                        text=f"```\nERROR: Cannot set goal to '{goal}'. Goal is locked. Wait {remaining} more moves before changing.\n```",
-                    )
-                ]
-
-            client.current_goal = goal
-            client.goal_counter = 0
-            client.goal_locked_until_counter = 10
-
-            if client.state_file:
-                try:
-                    existing: dict[str, Any] = {}
-                    if os.path.exists(client.state_file):
-                        with open(client.state_file, "r") as f:
-                            existing = json.load(f)
-                    existing["session_name"] = client.session_name
-                    existing["current_goal"] = goal
-                    existing["goal_counter"] = 0
-                    existing["goal_locked_until_counter"] = 10
-                    existing["status"] = "playing"
-                    with open(client.state_file, "w") as f:
-                        json.dump(existing, f)
-                except Exception as exc:
-                    _log_error("nethack_set_goal: saving state", exc)
-
-            print(f"[AI CALL RESULT] {name}: Goal set to '{goal}'", file=sys.stderr, flush=True)
-            return [types.TextContent(type="text", text=f"```\nGoal set: {goal}\n```")]
-
-        elif name == "nethack_diff":
-            state = await asyncio.to_thread(client.get_state)
-            diff = state.get("diff", "No diff available")
-            return [types.TextContent(type="text", text=f"```\n{diff}\n```")]
-
-        else:
-            return [
-                types.TextContent(
-                    type="text",
-                    text=f"```\nError: Unknown tool: {name}\n```",
-                )
+        if name == "nethack_map":
+            payload = await asyncio.to_thread(client.map_payload)
+            if payload.get("status") == "error":
+                return _tool(f"ERROR: {payload.get('error')}")
+            body = [
+                f"MAP level {payload['level']}  ({payload['player']})",
+                payload["map"].rstrip("\n"),
+                "",
+                "FRONTIER (?) - unrevealed cells you can walk to:",
+                payload["frontier"],
             ]
+            summary = payload["summary"]
+            if summary.get("rooms"):
+                body.append("")
+                body.append("ROOMS")
+                for room in summary["rooms"]:
+                    min_r, max_r, min_c, max_c = room["bounds"]
+                    doors = ", ".join(f"({d[0]},{d[1]})" for d in room["doors"]) or "none"
+                    body.append(
+                        f"  room {room['id']}: rows {min_r}..{max_r} cols {min_c}..{max_c} "
+                        f"({room['size']} floor) doors: {doors}"
+                    )
+            return _tool("\n".join(body))
 
-    except Exception as e:
+        if name == "nethack_diff":
+            state = await asyncio.to_thread(client.get_state)
+            return _tool(state.get("diff") or "no changes recorded")
+
+        if name == "nethack_set_goal":
+            client.current_goal = arguments.get("goal", "")
+            client._persist_state(client.game_state or {})
+            return _tool(f"Goal set: {client.current_goal}")
+
+        if name == "nethack_stop":
+            result = await asyncio.to_thread(client.stop_game)
+            return _tool(json.dumps(result))
+
+        return _tool(f"ERROR: unknown tool '{name}'")
+    except Exception as exc:
         import traceback
 
-        error_result = {"error": str(e), "traceback": traceback.format_exc()}
-        print(f"[AI CALL RESULT] {name}: EXCEPTION - {json.dumps(error_result)}", file=sys.stderr, flush=True)
-        return [
-            types.TextContent(
-                type="text",
-                text=f"```\nException: {json.dumps(error_result, indent=2)}\n```",
-            )
-        ]
+        _log_error(f"tool {name}", exc)
+        return _tool(f"Exception: {exc}\n{traceback.format_exc()}")
 
 
-async def run() -> None:
-    """Start the MCP server on stdio."""
+def _show_fullscreen(state: dict[str, Any]) -> None:
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.write(_format_state(state))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _capabilities() -> types.ServerCapabilities:
     caps = server.get_capabilities(
         notification_options=NotificationOptions(),
         experimental_capabilities={},
     )
-    caps.tools = types.ToolsCapability(listChanged=True)
+    caps.tools = types.ToolsCapability(listChanged=False)
+    return caps
 
+
+async def run() -> None:
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
             InitializationOptions(
                 server_name="nethack-mcp",
-                server_version="0.1.0",
-                capabilities=caps,
+                server_version="0.2.0",
+                capabilities=_capabilities(),
                 instructions=SERVER_INSTRUCTIONS,
             ),
         )
 
 
 async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = False) -> None:
-    """Start the MCP server over SSE/HTTP so you can watch the game."""
-    from starlette.responses import PlainTextResponse
-
+    """HTTP transport: /mcp (streamable) plus the legacy /sse endpoints."""
     import uvicorn
+    from starlette.responses import PlainTextResponse
 
     global _fullscreen
     _fullscreen = fullscreen
 
     sse = mcp.server.sse.SseServerTransport("/messages/")
 
-    # Streamable HTTP transport (POST/GET/DELETE on /mcp) — what modern MCP
-    # clients like OpenCode >= 2.0 use; they no longer fall back to SSE.
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
     session_manager = StreamableHTTPSessionManager(
@@ -1060,18 +1114,13 @@ async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = Fa
 
     async def handle_sse(scope, receive, send):
         async with sse.connect_sse(scope, receive, send) as (read_stream, write_stream):
-            caps = server.get_capabilities(
-                notification_options=NotificationOptions(),
-                experimental_capabilities={},
-            )
-            caps.tools = types.ToolsCapability(listChanged=True)
             await server.run(
                 read_stream,
                 write_stream,
                 InitializationOptions(
                     server_name="nethack-mcp",
-                    server_version="0.1.0",
-                    capabilities=caps,
+                    server_version="0.2.0",
+                    capabilities=_capabilities(),
                     instructions=SERVER_INSTRUCTIONS,
                 ),
             )
@@ -1082,54 +1131,36 @@ async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = Fa
             if path == "/sse" and scope["method"] == "GET":
                 await handle_sse(scope, receive, send)
                 return
-            elif path == "/health" and scope["method"] == "GET":
-                response = PlainTextResponse("ok")
-                await response(scope, receive, send)
+            if path == "/health" and scope["method"] == "GET":
+                await PlainTextResponse("ok")(scope, receive, send)
                 return
-            elif path == "/mcp":
+            if path == "/mcp":
                 await handle_streamable_http(scope, receive, send)
                 return
-            elif path.startswith("/messages/") and scope["method"] == "POST":
+            if path.startswith("/messages/") and scope["method"] == "POST":
                 await sse.handle_post_message(scope, receive, send)
                 return
-        response = PlainTextResponse("Not found", status_code=404)
-        await response(scope, receive, send)
+        await PlainTextResponse("Not found", status_code=404)(scope, receive, send)
 
-    print(f"NetHack MCP server listening on http://{host}:{port}/mcp and /sse", flush=True)
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
-    server_uv = uvicorn.Server(config)
+    print(f"NetHack MCP server on http://{host}:{port}/mcp (and /sse)", flush=True)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     async with session_manager.run():
-        await server_uv.serve()
+        await uvicorn.Server(config).serve()
 
 
 def main() -> None:
-    """CLI entry point — defaults to stdio transport."""
     import argparse
 
     parser = argparse.ArgumentParser(description="NetHack MCP server")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument(
-        "--transport",
-        choices=["stdio", "sse"],
-        default="stdio",
-        help="Transport mode (default: stdio)",
-    )
-    parser.add_argument(
-        "--port", type=int, default=8000, help="Port for SSE mode (default: 8000)"
-    )
-    parser.add_argument(
-        "--host",
-        default="0.0.0.0",
-        help="Host for SSE mode (default: 0.0.0.0)",
-    )
-    parser.add_argument(
-        "--fullscreen",
-        action="store_true",
-        help="Watch mode: print screen + map to terminal",
+        "--fullscreen", action="store_true", help="watch mode: redraw screen+map in the terminal"
     )
     args = parser.parse_args()
 
     if args.transport == "sse":
-        print(f"Starting NetHack MCP server in SSE mode on {args.host}:{args.port}", flush=True)
         asyncio.run(run_sse(port=args.port, host=args.host, fullscreen=args.fullscreen))
     else:
         asyncio.run(run())
