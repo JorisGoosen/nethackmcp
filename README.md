@@ -15,6 +15,8 @@ uv run python run_server.py --transport sse --port 8000   # http, /mcp and /sse
 Point a client at `http://host:8000/mcp` (streamable HTTP) or `/sse` (legacy).
 Requires `nethack` and `tmux` on the host.
 
+Working on this repo (rather than playing through it): see `AGENTS.md`.
+
 ## Tools
 
 | tool | what it does |
