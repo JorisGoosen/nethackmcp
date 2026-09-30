@@ -62,17 +62,25 @@ Four rules make it trustworthy to navigate by:
 2. **Adjacency settles a `?`.** When you stand next to an unrevealed tile it
    becomes real: whatever glyph is drawn there (`.`, `#`, `+`, `<`, `>`) or, if
    it stays blank, a confirmed `X`.  A tile showing a monster or item becomes
-   walkable ground - nothing is ever drawn inside rockwall.
+   walkable ground - nothing is ever drawn inside rockwall.  "Stays blank"
+   includes a position past the end of the row: tmux reports a row without its
+   trailing blanks, so the row ending there is still a drawn nothing.
 3. **Door state comes from the glyph** (`include/defsym.h`): `+` is a door that
-   is *shut*, an *open* door is drawn as the wall it sits in (`|`/`-`) and a
-   doorless doorway as `.`.  A position once seen as `+` stays a doorway forever
-   and renders `+` while shut, `'` while open - so the map says whether you can
-   walk through it or have to `o`pen it first.
+   is *shut*, an *open* door is drawn as the wall it sits in (`-` for a vertical
+   wall, `|` for a horizontal one - the same characters the walls themselves
+   use, so only memory can tell them apart) and a doorless doorway as `.`.  A
+   position once seen as `+` stays a doorway forever and renders `+` while shut,
+   `'` while open - so the map says whether you can walk through it or have to
+   `o`pen it first.
 4. **A `?` is only shown where you could actually go.** It must touch ground you
    can reach over remembered terrain, otherwise it is not an exploration target.
    Reachability also honours NetHack's rule that a diagonal step into or out of
    an intact doorway is refused, so a route never promises a move the game will
    not make.
+
+Terrain learned from a monster or an item is stored as *guessed*: the tile is
+ground, but nothing has ever drawn it as floor, and a guess is worth less than
+what you walked on.
 
 `FRONTIER` lists, per unrevealed area, the tile to stand on, the steps and keys
 to get there and the one key that pokes the area into reality:
@@ -86,22 +94,38 @@ Sending route+probe as a single `nethack_move` therefore always learns
 something.  Routes carry `o<dir><dir>` where they must open a shut door on the
 way, and warn when the way in is locked or a trap lies on the path.
 
-## Position tracking
+## Where the screen meets memory
 
 World position is `dungeon_offset + screen_position`, origin where you first
-appeared on a level.  The offset is re-derived on every screen by matching the
-drawn terrain against remembered geometry:
+appeared on a level.  Every screen has to be *placed*, and the screen has the
+last word, because the keys lie: a step into a wall, a monster in the way, a run
+key that stops where it likes, a teleport, or a window that slid a row when a
+message cleared.
 
-* an offset is only usable when it contradicts nothing that is remembered, which
-  stops a wrong alignment from smearing walls over the map;
-* the keyboard has the last word when it is consistent - one vi-key is exactly
-  one tile - so flat corridors with nothing distinctive to match cannot drift;
-* the map window is *detected*, not assumed: its height changes with the message
-  window, and because the map is centred on the player the whole dungeon shifts
-  a row when a message clears.
+* the search starts where the keys say the hero should be, then where the screen
+  sat last time, and works outward one tile at a time;
+* the first alignment that contradicts nothing wins - it is the nearest one, so
+  there is nothing left to weigh;
+* an alignment only earns trust by being *tested*.  One that slides the window off
+  the edge of the remembered level contradicts nothing simply because it looks at
+  nothing, so candidates covering too little are thrown away;
+* every tile class counts the same: rockwall matches blank (walls are never drawn),
+  an open door matches a shut one, room floor agrees with cave floor, and
+  something standing on a tile we only ever know as a wall glyph is no
+  contradiction - walking through a door seen so far only from the open side is
+  drawn as `@` over `-`;
+* remembered terrain is never quietly erased.  A blank over ground you have
+  actually seen *is* a disagreement, and it is reported - "N of the M remembered
+  tiles this screen covers disagree" - instead of papered over.  While a screen
+  conflicts, memory keeps its shape and only genuinely new tiles are learned.
+
+Each level has its own map and its own origin, and a level's memory survives
+going downstairs and back up.
 
 Screens that are not the dungeon (menus, prompts, death screens) are recognised
-and never read as terrain.
+and never read as terrain, and the map window is *detected* rather than assumed:
+its first row moves with the message window, which is why the whole dungeon can
+shift a row between two screens without you moving.
 
 ## Tests
 
