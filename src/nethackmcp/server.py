@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -73,15 +74,20 @@ tmux session and keeps a *memory map* of every level for you.
 - **Cancel** whatever is pending: `Escape` (also closes a menu); `?` for help
 
 You do not need to clear message pages: when the screen sits on `--More--`, the
-next command drains it with Space first and reports what it skimmed past.
+next command drains it with Space first, and what it turned past is handed back
+as a `PAGER` block at the top of the reply - the concatenated screen diffs of
+each page turn, so nothing that scrolled by is lost to you.
 Letters do not dismiss `--More--` in this build, which is why that matters.
 
 ## What every move returns
 
+`PAGER` (only when pages were drained: diffs of the skipped text, prepended),
 `SCREEN` (raw), `NEIGHBOURS` (the eight tiles around you and what the map
-remembers about each), `MAP` (accumulated memory), `FRONTIER` (the places still
-worth exploring, with the keys to reach them) and `MOVE` when your key did not
-do what you asked.
+remembers about each), `YOU ARE` (your world position and what you stand on),
+`MAP` (accumulated memory - **always shown**, even when the screen is a menu;
+the map keeps whatever it last knew), `FRONTIER` (the places still worth
+exploring, with the keys to reach them) and `MOVE` when your key did not do
+what you asked.
 
 ### Map glyphs
 
@@ -224,6 +230,10 @@ class NetHackClient:
         self.previous_screen: str | None = None
         self.game_state: dict[str, Any] = {}
         self.cleared_messages: list[str] = []
+        self.pager_diff: str = ""
+        # the fullscreen poller reads and merges the map concurrently with tool
+        # calls; a command must stay atomic so a capture never lands mid-sequence
+        self._lock = threading.RLock()
         if restore:
             self._restore_state()
 
@@ -301,8 +311,13 @@ class NetHackClient:
 
         Letters do not dismiss ``--More--`` in this build - only Space does, so
         sending a movement key while the pager is up loses the key entirely.
+
+        Each Space that turns a page changes what the message window shows, so
+        we record a diff of that change; the concatenation tells the agent what
+        it would otherwise have skimmed past without ever seeing it.
         """
         cleared: list[str] = []
+        pager_diffs: list[str] = []
         for _ in range(limit):
             joined = "\n".join(screen_lines)
             if "--More--" not in joined:
@@ -312,8 +327,13 @@ class NetHackClient:
                 cleared.append(text)
             self._send_keys("Space")
             time.sleep(0.15)
-            _, screen_lines = self._capture_screen()
+            _, after_lines = self._capture_screen()
+            page_diff = self._create_diff(after_lines, screen_lines)
+            if page_diff:
+                pager_diffs.append(page_diff)
+            screen_lines = after_lines
         self.cleared_messages = cleared
+        self.pager_diff = "\n".join(pager_diffs)
         return cleared
 
     def _wait_until_stable(self, timeout: float = 2.0, settle: float = 0.25) -> list[str]:
@@ -343,8 +363,11 @@ class NetHackClient:
 
     @staticmethod
     def _status_row(screen_lines: list[str]) -> int | None:
+        # get_strength_str() (src/botl.c) writes St as 15, 18/51, 18/** or 100+,
+        # so the optional /xx suffix must be part of the match: missing it makes
+        # the name row look like map body and the junk budget rejects the window.
         for r, line in enumerate(screen_lines):
-            if "Dlvl:" in line or re.search(r"\bSt:\d+\s+Dx:", line):
+            if "Dlvl:" in line or re.search(r"\bSt:\d+(?:/[0-9*]+)?\s+Dx:", line):
                 return r
         return None
 
@@ -500,6 +523,10 @@ class NetHackClient:
 
     def start_game(self, character: str = "Hero") -> dict[str, Any]:
         """Start a fresh NetHack game in a dedicated tmux session."""
+        with self._lock:
+            return self._start_game(character)
+
+    def _start_game(self, character: str = "Hero") -> dict[str, Any]:
         session_name = self._new_session_name()
         state_file = self._new_state_file()
         self.stop_game()
@@ -565,6 +592,10 @@ class NetHackClient:
 
     def send_command(self, command: str) -> dict[str, Any]:
         """Send keystrokes to NetHack and return the resulting state."""
+        with self._lock:
+            return self._run_command(command)
+
+    def _run_command(self, command: str) -> dict[str, Any]:
         if self.session_name is None:
             return {"status": "error", "error": "Game not started. Call start_game first."}
         if not command:
@@ -631,15 +662,17 @@ class NetHackClient:
                 notes.append(note)
         if notes:
             state["move_result"] = "\n".join(notes)
-        state["diff"] = self._create_diff(
-            state.get("screen_lines", []), self.previous_screen.split("\n")
-        )
-        self.previous_screen = "\n".join(state.get("screen_lines", []))
+        if self.pager_diff:
+            state["pager_diff"] = self.pager_diff
         self._persist_state(state)
         return state
 
     def stop_game(self) -> dict[str, Any]:
         """Kill the tmux session and forget this game."""
+        with self._lock:
+            return self._stop_game()
+
+    def _stop_game(self) -> dict[str, Any]:
         if self.session_name is not None:
             try:
                 if self._session_alive():
@@ -791,8 +824,18 @@ class NetHackClient:
             lines.append(f"... {len(groups) - limit} more, further away")
         return "\n".join(lines)
 
-    def get_state(self, expected_world: tuple[int, int] | None = None) -> dict[str, Any]:
-        """Full game state: screen, map memory, frontier, hints."""
+    def get_state(self, expected_world: tuple[int, int] | None = None,
+                  advance_baseline: bool = True) -> dict[str, Any]:
+        """Full game state: screen, map memory, frontier, hints.
+
+        ``advance_baseline`` is False for the fullscreen watch poller, which
+        must not steal the diff baseline from between real tool calls.
+        """
+        with self._lock:
+            return self._collect_state(expected_world, advance_baseline)
+
+    def _collect_state(self, expected_world: tuple[int, int] | None = None,
+                       advance_baseline: bool = True) -> dict[str, Any]:
         raw_text, screen_lines = self._capture_screen()
 
         if self._is_new_game_screen(raw_text):
@@ -803,7 +846,12 @@ class NetHackClient:
             self.current_level = new_level
 
         info = self.update_map(screen_lines, expected_world=expected_world)
-        dungeon_map = self.maps.get(self.current_level)
+        # The map and the player's place on it are always part of the answer:
+        # the agent guides itself by them and should never have to ask for a
+        # map it then finds missing.  A level nothing was learned of yet
+        # renders "(no memory yet)"; a screen that is not the map (menu,
+        # prompt) still gets back the memory as it stands.
+        dungeon_map = self.get_map()
         if info.get("conflicts"):
             state_warning = (
                 f"{info['conflicts']} of the {info['coverage']} remembered tile(s) this "
@@ -813,6 +861,12 @@ class NetHackClient:
         else:
             state_warning = ""
 
+        diff = ""
+        if self.previous_screen:
+            diff = self._create_diff(screen_lines, self.previous_screen.split("\n"))
+        if advance_baseline:
+            self.previous_screen = raw_text
+
         state: dict[str, Any] = {
             "status": "playing",
             "screen": raw_text.rstrip("\n"),
@@ -820,23 +874,23 @@ class NetHackClient:
             "session_name": self.session_name,
             "level": self.current_level,
             "map_updated": info.get("updated", False),
+            "diff": diff,
         }
         if state_warning:
             state["map_warning"] = state_warning
-        if dungeon_map is not None:
-            summary = dungeon_map.describe()
-            state["player_world_pos"] = summary["player_world_pos"]
-            state["map_summary"] = summary
-            hints = []
-            if self.current_goal:
-                hints.append(f"Goal: {self.current_goal}")
-            neighbours = self._neighbour_hints(screen_lines)
-            if neighbours:
-                hints.append("NEIGHBOURS\n" + neighbours)
-            hints.append(f"YOU ARE: {self._describe_position(dungeon_map)}")
-            state["hints"] = "\n\n".join(hints)
-            state["map"] = dungeon_map.render()
-            state["frontier"] = self._frontier_report(summary)
+        summary = dungeon_map.describe()
+        state["player_world_pos"] = summary["player_world_pos"]
+        state["map_summary"] = summary
+        hints = []
+        if self.current_goal:
+            hints.append(f"Goal: {self.current_goal}")
+        neighbours = self._neighbour_hints(screen_lines)
+        if neighbours:
+            hints.append("NEIGHBOURS\n" + neighbours)
+        hints.append(f"YOU ARE: {self._describe_position(dungeon_map)}")
+        state["hints"] = "\n\n".join(hints)
+        state["map"] = dungeon_map.render()
+        state["frontier"] = self._frontier_report(summary)
 
         if "--More--" in raw_text:
             state["prompt"] = (
@@ -853,9 +907,7 @@ class NetHackClient:
 
     def map_payload(self) -> dict[str, Any]:
         """Map-only payload (no screen capture)."""
-        dungeon_map = self.maps.get(self.current_level)
-        if dungeon_map is None:
-            return {"status": "error", "error": f"no map for level {self.current_level}"}
+        dungeon_map = self.get_map()
         summary = dungeon_map.describe()
         return {
             "status": "success",
@@ -958,19 +1010,25 @@ def get_client() -> NetHackClient:
 def _format_state(state: dict[str, Any]) -> str:
     if state.get("status") == "error":
         return f"ERROR: {state.get('error')}"
-    parts = ["=== SCREEN ===", state.get("screen", "")]
+    parts = []
+    if state.get("pager_diff"):
+        parts += [
+            "=== PAGER (skipped while the --More-- pages were drained) ===",
+            state["pager_diff"],
+            "",
+        ]
+    parts += ["=== SCREEN ===", state.get("screen", "")]
     if state.get("move_result"):
         parts += ["", "=== MOVE ===", state["move_result"]]
     if state.get("map_warning"):
         parts += ["", f"WARNING: {state['map_warning']}"]
     if state.get("hints"):
         parts += ["", state["hints"]]
-    if state.get("map"):
-        parts += [
-            "",
-            f"=== MAP (level {state.get('level')}) ===",
-            state["map"].rstrip("\n"),
-        ]
+    header = f"=== MAP (level {state.get('level')}) ==="
+    pos = state.get("player_world_pos")
+    if pos:
+        header = f"=== MAP (level {state.get('level')}, you at ({pos[0]},{pos[1]})) ==="
+    parts += ["", header, state.get("map", "(no memory yet)").rstrip("\n")]
     if state.get("frontier"):
         parts += ["", "=== FRONTIER (?) ===", state["frontier"]]
     summary = state.get("map_summary") or {}
@@ -1061,6 +1119,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
         if name == "nethack_start":
             character = arguments.get("character") or "Hero"
             state = await asyncio.to_thread(client.start_game, character)
+            if _fullscreen:
+                _show_fullscreen(state)
             return _tool(_format_state(state))
 
         if name == "nethack_move":
@@ -1074,6 +1134,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
 
         if name == "nethack_state":
             state = await asyncio.to_thread(client.get_state)
+            if _fullscreen:
+                _show_fullscreen(state)
             return _tool(_format_state(state))
 
         if name == "nethack_map":
@@ -1102,7 +1164,11 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
 
         if name == "nethack_diff":
             state = await asyncio.to_thread(client.get_state)
-            return _tool(state.get("diff") or "no changes recorded")
+            if not state.get("diff"):
+                state["diff"] = "no changes since the previous read"
+            if _fullscreen:
+                _show_fullscreen(state)
+            return _tool(_format_state(state))
 
         if name == "nethack_set_goal":
             client.current_goal = arguments.get("goal", "")
@@ -1122,10 +1188,34 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
 
 
 def _show_fullscreen(state: dict[str, Any]) -> None:
-    sys.stdout.write("\033[H\033[J")
-    sys.stdout.write(_format_state(state))
-    sys.stdout.write("\n")
+    """Redraw in place: home the cursor and overwrite, erasing each line's
+    tail and whatever the previous frame left below - never clear the whole
+    screen, so the watch does not flicker between frames."""
+    out = ["\033[H"]
+    out += [f"{line}\033[K\n" for line in _format_state(state).split("\n")]
+    out.append("\033[J")
+    sys.stdout.write("".join(out))
     sys.stdout.flush()
+
+
+async def _watch_loop(client: NetHackClient, interval: float = 1.0) -> None:
+    """Fullscreen watch: redraw the screen and the memory map live, whether
+    or not the agent has acted lately.  Reading merges the screen into memory
+    (that is how the map grows while you watch) but never touches the diff
+    baseline real tool calls compare against."""
+    while True:
+        try:
+            state = await asyncio.to_thread(
+                client.get_state, None, False  # expected_world, advance_baseline
+            )
+            _show_fullscreen(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - game simply not running yet
+            _show_fullscreen(
+                {"status": "playing", "screen": f"(no game to watch: {exc})", "level": None}
+            )
+        await asyncio.sleep(interval)
 
 
 def _capabilities() -> types.ServerCapabilities:
@@ -1205,8 +1295,15 @@ async def run_sse(port: int = 8000, host: str = "0.0.0.0", fullscreen: bool = Fa
 
     print(f"NetHack MCP server on http://{host}:{port}/mcp (and /sse)", flush=True)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    watch: asyncio.Task | None = None
+    if fullscreen:
+        watch = asyncio.create_task(_watch_loop(get_client()))
     async with session_manager.run():
-        await uvicorn.Server(config).serve()
+        try:
+            await uvicorn.Server(config).serve()
+        finally:
+            if watch is not None:
+                watch.cancel()
 
 
 def main() -> None:
@@ -1217,9 +1314,20 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument(
-        "--fullscreen", action="store_true", help="watch mode: redraw screen+map in the terminal"
+        "--fullscreen",
+        action="store_true",
+        help=(
+            "watch mode (SSE transport): keep redrawing screen + memory map live "
+            "in this terminal, overwriting in place"
+        ),
     )
     args = parser.parse_args()
+
+    if args.fullscreen and args.transport != "sse":
+        print(
+            "[INFO] --fullscreen needs --transport sse: on stdio stdout carries the protocol",
+            file=sys.stderr,
+        )
 
     if args.transport == "sse":
         asyncio.run(run_sse(port=args.port, host=args.host, fullscreen=args.fullscreen))

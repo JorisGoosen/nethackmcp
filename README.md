@@ -10,6 +10,7 @@ agent knows where it has been and where there is still something to discover.
 uv sync
 uv run python run_server.py                       # stdio
 uv run python run_server.py --transport sse --port 8000   # http, /mcp and /sse
+uv run python run_server.py --transport sse --fullscreen  # + live watch in the server terminal
 ```
 
 Point a client at `http://host:8000/mcp` (streamable HTTP) or `/sse` (legacy).
@@ -25,13 +26,22 @@ Working on this repo (rather than playing through it): see `AGENTS.md`.
 | `nethack_move`  | send keystrokes; returns screen, memory map, frontier and hints |
 | `nethack_state` | the same view without sending anything |
 | `nethack_map`   | just the memory map, frontier routes and rooms |
-| `nethack_diff`  | characters that changed on screen since the last read |
+| `nethack_diff`  | the state view; its `DIFF` block lists the characters that changed since the previous read |
 | `nethack_set_goal` | record what you are trying to do; shown with every state |
 | `nethack_stop`  | kill the tmux session and discard the maps |
 
+Every reply carries the **memory map and your position on it** - the agent does
+not have to choose to look at the map, and a screen that is not the map (a
+menu, a prompt) still gets back the memory as it stands.
+
 A pending `--More--` pager is drained automatically (with Space, since letters
-do not dismiss it) before your command is sent, and the skipped message text is
-reported back.
+do not dismiss it) before your command is sent; the pages it turned come back
+concatenated as screen diffs in a `PAGER` block **prepended** to the reply, so
+skimmed-past text is never lost.
+
+`--fullscreen` (with the SSE transport) turns the server terminal into a live
+watch: the screen and the memory map are redrawn every second, overwriting in
+place rather than clearing.
 
 ## Keys
 

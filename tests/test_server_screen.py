@@ -4,15 +4,22 @@ These guard the parts that used to corrupt the map:
 
 * reading terrain out of the message line ("You don't have that object."),
 * reading terrain out of menus that are not the dungeon at all,
-* losing whole rooms because the dungeon offset drifted.
+* losing whole rooms because the dungeon offset drifted,
+* losing the *entire* map because a `St:18/01` strength hid the status row.
 """
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from nethackmcp.map import VISIBLE_TERRAIN
-from nethackmcp.server import NetHackClient, keys_for
+from nethackmcp.server import (
+    NetHackClient,
+    _format_state,
+    _show_fullscreen,
+    keys_for,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -345,6 +352,104 @@ def test_pager_is_not_reported_as_a_prompt(client):
     """--More-- is drained, not answered: it must not look like a question."""
     lines = ["This door is locked.--More--", "", *MAP_ROWS_]
     assert client._open_prompt(lines) == ""
+
+
+def test_draining_the_pager_records_a_diff_of_each_page(client, monkeypatch):
+    """The agent never sees the pages it skimmed past on screen, so each Space
+    that turns one must be captured as a diff of what changed."""
+    frames = [
+        ["A wolf bites!--More--", "", *MAP_ROWS_],
+        ["You miss.  A wolf bites!--More--", "", *MAP_ROWS_],
+        ["", "", *MAP_ROWS_],
+    ]
+    cursor = {"i": 0}
+
+    def fake_send_keys(*keys):
+        cursor["i"] = min(cursor["i"] + 1, len(frames) - 1)
+
+    monkeypatch.setattr(client, "_send_keys", fake_send_keys)
+    monkeypatch.setattr(
+        client, "_capture_screen", lambda: ("\n".join(frames[cursor["i"]]), frames[cursor["i"]])
+    )
+
+    cleared = client._drain_more(frames[0])
+    assert len(cleared) == 2
+    assert client.pager_diff, "the turned pages must be recorded, not thrown away"
+    assert "wolf" in client.pager_diff or "miss" in client.pager_diff
+
+
+# --------------------------------------------------------------------------- #
+#  the status row: St:18/01 must not hide the map (the bug that lost everything)
+# --------------------------------------------------------------------------- #
+
+
+def test_percentile_strength_status_row_is_detected(client, real_lines):
+    """'St:18/01' (percentile strength) used to fail the regex, so the map
+    window ran one row too low, ate the character-name line as map body, and
+    the whole map vanished from every tool reply."""
+    percentile = [line.replace("St:15 Dx:18", "St:18/01 Dx:11") for line in real_lines]
+    assert client._status_row(percentile) == 22
+    assert client._map_window(percentile) == (1, 21)
+    load(client, percentile)
+    assert client.maps[1].remembered_count() > 0, "the map was lost to a strength suffix"
+
+
+def test_starred_strength_status_row_is_detected(client, real_lines):
+    """'St:18/**' (over 100 percentile) is a status row too."""
+    starred = [line.replace("St:15 Dx:18", "St:18/** Dx:11") for line in real_lines]
+    assert client._status_row(starred) == 22
+    assert client._map_window(starred) is not None
+
+
+# --------------------------------------------------------------------------- #
+#  the map is always part of the answer
+# --------------------------------------------------------------------------- #
+
+
+def test_map_and_position_always_reach_the_agent(client, monkeypatch, real_lines):
+    """Even a screen that is not the map (a menu) hands back the memory map as
+    it stands and the player's position - the agent should never have to ask."""
+    load(client, real_lines)
+    remembered_before = client.maps[1].remembered_count()
+    inventory = [
+        "Invoking:                        Prepare",
+        "* a +0 dart (in quiver: b +0 dart)",
+        "  b - a katana",
+        "Virtuoos the Ronin   St:18/01 Dx:11 Co:18 In:9 Wi:8 Ch:8 Lawful",
+        "Dlvl:1 $:10 HP:15(15) Pw:2(2) AC:4 Xp:1",
+    ]
+    monkeypatch.setattr(client, "_capture_screen", lambda: ("\n".join(inventory), inventory))
+
+    state = client.get_state()
+    assert state.get("map"), "the memory map must be in every state"
+    assert state["map"].count("#") + state["map"].count(".") > 0, "map was not the remembered one"
+    assert remembered_before > 0
+    assert "YOU ARE" in state.get("hints", "")
+    assert "unknown position" not in state["hints"], "position survived from memory"
+    out = _format_state(state)
+    assert "=== MAP" in out
+    assert "YOU ARE" in out
+
+
+def test_nothing_to_watch_still_renders_without_a_clear(monkeypatch):
+    """The fullscreen watch homes and overwrites; it must never emit a full
+    screen clear, and must survive a state with no map yet."""
+    captured = []
+
+    class FakeStdout:
+        def write(self, s):
+            captured.append(s)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", FakeStdout())
+    _show_fullscreen({"status": "playing", "screen": "x", "level": 1})
+    text = "".join(captured)
+    assert text.startswith("\033[H"), "the cursor must home, not clear"
+    assert "\033[2J" not in text, "a full clear flickers; the watch overwrites instead"
+    assert "=== MAP" in text, "the map belongs in the fullscreen view too"
+
 
 
 def test_menu_still_blocks_map_learning(client, real_lines):
