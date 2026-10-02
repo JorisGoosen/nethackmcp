@@ -92,8 +92,12 @@ what you asked.
 ### Map glyphs
 
 The game's own alphabet where it can be.  From `include/defsym.h`: a door is
-drawn `+` while it is **shut** and as the wall it sits in (`|`/`-`) once it is
-**open**, which is why the map spells the two states out separately.
+drawn `+` while it is **shut** and as the wall it sits in (`|` for a door in a
+horizontal wall, `-` in a vertical one) once it is **open**, which is why the
+map spells the two states out separately.  A door you never saw shut is still
+recognised from its setting - a wall glyph with wall or confirmed rockwall on
+its two sides and ground, or yet-unseen tiles, beyond it - and remembered as
+an open doorway `'` like any other.
 
 | | |
 |---|---|

@@ -14,10 +14,20 @@ The map is a record of *memory*, not of the real level.
 * The only way a blank becomes a *known* wall is the player bumping into it;
   those tiles are marked solid and rendered ``X``.
 * **Door state is readable from the glyph** (``include/defsym.h``): ``+`` is a
-  **shut** door, an **open** door is drawn as the wall it sits in (``|``/``-``)
-  and a doorless doorway is drawn ``.``.  So once a position has been seen as
-  ``+`` it stays a doorway forever, and its current glyph tells us whether the
-  way through it is open right now.
+  **shut** door, an **open** door is drawn as the wall it sits in (``|`` for a
+  door in a horizontal wall, ``-`` in a vertical one) and a doorless doorway
+  is drawn ``.``.  So once a position has been seen as ``+`` it stays a
+  doorway forever, and its current glyph tells us whether the way through it
+  is open right now.
+* A door never yet seen shut is still recognisable from its setting
+  (``infer_doorways``): a ``|`` with wall or confirmed rockwall on its left
+  and right, over ground or still-unseen tiles above and below, is an open
+  door - a plain wall tile always has the room's floor as one of its flanks,
+  and a corner always has wall, rock or a doorway where a passage would be.
+  Doorways themselves are evidence on neither axis, so an inference never
+  creeps outwards from a known door.  The evidence has to be *seen*: an
+  unexplored blank flanks nothing, because a blank is only rockwall once
+  something has confirmed it.
 * NetHack refuses **diagonal** moves into or out of an intact doorway, so routes
   never plan one.
 
@@ -212,7 +222,8 @@ class Tile:
     visited: bool = False
     #: this position is a doorway.  An *open* door is drawn with the wall glyph
     #: of the wall it sits in (``|`` or ``-``), so seeing a wall here does not
-    #: undo the fact that it is a way through.
+    #: undo the fact that it is a way through.  It gets set by seeing ``+``,
+    #: by standing in it, and by ``infer_doorways`` reading the wall around it.
     doorway: bool = False
     #: a trap has been spotted here (``^``); the tile is still floor
     trap: bool = False
@@ -446,6 +457,95 @@ class DungeonMap:
             return  # a wall or floor we saw drawn is not a surprise obstacle
         tile.solid = True
         self._invalidate()
+        # a newly confirmed rockwall is exactly the evidence a nearby open
+        # door was waiting for: its wall neighbours are never drawn until
+        # something stands where the room used to be unseen
+        self.infer_doorways()
+
+    # ------------------------------------------------------------------ #
+    #  open doors, read from the wall around them
+    # ------------------------------------------------------------------ #
+
+    def _wall_evidence(self, pos: tuple[int, int]) -> bool:
+        """One side of a door in a wall: remembered wall or confirmed rock.
+
+        ``|`` and ``-`` are the wall it continues, ``X`` is rockwall we
+        walked into - either says "the wall runs through here and not past
+        you".  An unexplored blank says nothing: it may be rockwall or it
+        may be ground nobody has looked at, so it is no evidence at all.
+        """
+        tile = self.tiles.get(pos)
+        if tile is None or tile.doorway:
+            return False
+        return bool(tile.solid) or tile.terrain in (WALL_V, WALL_H)
+
+    def _ground_or_unseen(self, pos: tuple[int, int]) -> bool:
+        """What an open door leads to: ground you can stand on, water, or
+        tiles we have simply not seen yet.
+
+        NetHack draws *through* an open door, so the ground beyond it joins
+        memory at the same moment the doorway does; treating unseen as
+        possible ground only means a door is recognised one screen earlier
+        or one bump later, never that a wall becomes walkable by accident -
+        anything the game confirms as impassable refuses this.
+
+        A doorway is no passage either: doors never lead straight into
+        other doors, and counting one would let an inference creep from a
+        known doorway along whatever wall stands beside it.
+        """
+        tile = self.tiles.get(pos)
+        if tile is None or not (tile.memory or tile.solid):
+            return True
+        if tile.doorway:
+            return False
+        return tile.passable or tile.terrain == LIQUID
+
+    def infer_doorways(self) -> int:
+        """Flag the ``|`` and ``-`` tiles that can only be open doors.
+
+        An open door is drawn with a wall glyph (``include/defsym.h``):
+        ``S_hodoor`` ``|`` is a door *in a horizontal wall* - you walk
+        through it north/south and the wall continues left/right - and
+        ``S_vodoor`` ``-`` is a door in a vertical wall.  So a wall glyph
+        is a doorway when both flanks are wall evidence and both ends of
+        the passage axis are ground or still unseen::
+
+            ...               <- ground (or unseen) above
+           XX|X               <- '|' with rock or wall left and right
+            ##                <- ground below: the door into the top-right room
+
+        No genuine wall tile can satisfy this: along a room wall one flank
+        is always the room's own floor, and a corner - drawn ``-`` however
+        the walls turn - has wall, rock or a doorway on its passage axis,
+        never plain ground.  Doorways count as evidence on neither axis:
+        that is what stops an inference creeping outwards from a known
+        door along the wall beside it.  Run after every merge and every
+        confirmed blank, so a door is recognised as soon as its
+        surroundings are known, "just like if it was a + first"; the state
+        is remembered, not re-guessed.
+
+        Returns how many tiles were newly flagged.
+        """
+        changed = 0
+        for (row, col), tile in self.tiles.items():
+            if tile.doorway or tile.solid or not tile.memory:
+                continue
+            if tile.terrain == WALL_V:
+                flanks = ((row, col - 1), (row, col + 1))
+                passage = ((row - 1, col), (row + 1, col))
+            elif tile.terrain == WALL_H:
+                flanks = ((row - 1, col), (row + 1, col))
+                passage = ((row, col - 1), (row, col + 1))
+            else:
+                continue
+            if all(self._wall_evidence(p) for p in flanks) and all(
+                self._ground_or_unseen(p) for p in passage
+            ):
+                tile.doorway = True
+                changed += 1
+        if changed:
+            self._invalidate()
+        return changed
 
     # ------------------------------------------------------------------ #
     #  screen -> map
@@ -767,6 +867,9 @@ class DungeonMap:
         )
         self.visit(*self.player_world_pos)
         self._reveal_neighbours(screen_lines, player_screen, map_rows)
+        # the screen just told us about walls, ground and fresh rockwall:
+        # an open door seen for the first time has its whole setting at once
+        self.infer_doorways()
 
         # the score was taken against the memory as it was before this screen
         coverage = matches + conflicts

@@ -692,6 +692,106 @@ def test_frontier_beyond_a_door_is_offered():
 
 
 # --------------------------------------------------------------------------- #
+#  open doors, recognised from the wall around them
+# --------------------------------------------------------------------------- #
+
+
+def test_open_door_recognised_between_confirmed_rock():
+    """The live shape: a '|' in a room's bottom wall with its wall neighbours
+    never drawn but confirmed rockwall where the hero bumped them, room floor
+    above, corridor below.  Only ever seen open, it is still the way in."""
+    dungeon_map = build(
+        [
+            " ... ",
+            "  |  ",
+            "#####",
+        ],
+        player=(2, 2),
+    )
+    door = (-1, 0)  # the '|' is world-adjacent to the corridor the hero walks
+    tile = dungeon_map.get_tile(*door)
+    assert tile.doorway, "wall flanks over ground above and below: it is a door"
+    assert tile.door_open and not tile.door_closed
+    assert dungeon_map.is_passable(*door)
+    assert dungeon_map.glyph_at(*door) == "'"  # rendered as the open doorway
+
+    # the route into the room now runs through it
+    assert dungeon_map.route_to((-2, 0)) == [door, (-2, 0)]
+    # ... but not diagonally: NetHack refuses that into an intact doorway
+    assert not dungeon_map.step_ok((0, -1), door)
+
+
+def test_imaginary_room_with_four_doors():
+    """A room whose doors all stand open; every other wall tile must stay a
+    wall - corners included."""
+    dungeon_map = build(
+        [
+            "---|-",
+            "-...|",
+            "|...-",
+            "---|-",
+        ],
+        player=(1, 2),
+    )
+    doors = {pos for pos, tile in dungeon_map.tiles.items() if tile.doorway}
+    # world = screen minus the player's screen position (1, 2)
+    assert doors == {(0 - 1, 3 - 2), (1 - 1, 0 - 2), (2 - 1, 4 - 2), (3 - 1, 3 - 2)}
+
+
+def test_plain_room_walls_are_never_inferred_as_doors():
+    """A whole room drawn at once: the only doorway is the shut '+'."""
+    dungeon_map = build(ROOM_SCREEN)
+    doors = {pos for pos, tile in dungeon_map.tiles.items() if tile.doorway}
+    assert doors == {(2, 0)}  # the '+' in the bottom wall
+
+
+def test_unseen_flanks_are_no_evidence_until_a_bump_proves_them():
+    """A blank says nothing - it is rockwall only once something confirms
+    it.  The door is recognised the moment the bumps complete its setting."""
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.observe(-2, 0, FLOOR)  # the room beyond
+    dungeon_map.observe(-1, 0, WALL_V)  # the door, seen only open so far
+    dungeon_map.observe(0, 0, CAVE)  # the corridor below
+    assert not dungeon_map.get_tile(-1, 0).doorway
+
+    dungeon_map.mark_solid(-1, -1)  # bumped: confirmed rock, one flank
+    assert not dungeon_map.get_tile(-1, 0).doorway
+    dungeon_map.mark_solid(-1, 1)  # ... and the other
+    assert dungeon_map.get_tile(-1, 0).doorway
+
+
+def test_confirmed_rock_where_the_door_should_lead_refuses_it():
+    """Ground on the passage axis may be unseen but never confirmed rock:
+    with rock above, this '|' is masonry, not a doorway."""
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.observe(-1, 0, WALL_V)
+    dungeon_map.mark_solid(-2, 0)  # above: solid
+    dungeon_map.observe(0, 0, CAVE)  # below: corridor
+    dungeon_map.mark_solid(-1, -1)
+    dungeon_map.mark_solid(-1, 1)
+    assert not dungeon_map.get_tile(-1, 0).doorway
+    assert not dungeon_map.is_passable(-1, 0)
+
+
+def test_a_known_door_never_begets_another_one():
+    """The corner beside a walked-through door: its passage axis runs into
+    that doorway.  A door is neither wall evidence nor ground - counting
+    one either way would let an inference creep from a known doorway along
+    the wall beside it, one tile per pass."""
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.observe(0, -1, DOOR)  # a doorway we know first-hand
+    dungeon_map.observe(0, -2, FLOOR)  # the room behind it
+    dungeon_map.observe(0, 1, CAVE)  # corridor around on the east
+    dungeon_map.observe(-1, 0, WALL_V)  # the wall run the corner joins
+    dungeon_map.observe(0, 0, WALL_H)  # the corner itself
+    dungeon_map.mark_solid(1, 0)  # rock below, bumped from the corridor
+    # flanks N/S: '|' and X - evidence.  passages W/E: the door and '#'.
+    assert dungeon_map.get_tile(0, -1).doorway  # unchanged, it is a door
+    assert not dungeon_map.get_tile(0, 0).doorway, "doorways do not beget doors"
+    assert not dungeon_map.is_passable(0, 0)
+
+
+# --------------------------------------------------------------------------- #
 #  routes
 # --------------------------------------------------------------------------- #
 
