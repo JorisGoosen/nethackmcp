@@ -541,3 +541,385 @@ def test_a_new_level_anchors_where_the_hero_lands(client, real_lines):
     load(client, slid)
     assert client.maps[2].player_world_pos == (0, 5), "the origin slid with the screen"
     assert client.maps[1].player_world_pos == (0, 0), "level 1 was redrawn by level 2"
+
+
+# --------------------------------------------------------------------------- #
+#  stepwise routes: verified key by key, never silently swallowed
+# --------------------------------------------------------------------------- #
+
+
+class FakePane:
+    """A scripted tmux pane: it renders a dungeon and *really* moves the @
+    for each direction key, refusing walls - so a swallowed or blocked key
+    changes the screen exactly the way the game would."""
+
+    def __init__(self, rows, hero, msg=""):
+        self.rows = [list(r) for r in rows]
+        self.hero = hero
+        self.msg = msg
+        self.sent = []
+        self.pager_at = None  # hero cell after which a message pages up
+        self.prompt_at = None  # hero cell after which the game asks a question
+
+    def render(self):
+        rows = ["".join(r) for r in self.rows]
+        r, c = self.hero
+        line = list(rows[r])
+        line[c] = "@"
+        rows[r] = "".join(line)
+        return [self.msg, "", *rows, "St:12 Dx:12", "Dlvl:1 $:0 HP:15(15)"]
+
+    def capture(self):
+        lines = self.render()
+        return "\n".join(lines), lines
+
+    def _passable(self, r, c):
+        if not (0 <= r < len(self.rows)) or not (0 <= c < len(self.rows[r])):
+            return False
+        return "".join(self.rows[r])[c] in ".#<>"
+
+    def send_keys(self, *keys):
+        self.sent.append(keys)
+        if "Space" in keys and "--More--" in self.msg:
+            self.msg = ""
+
+    def type(self, text):
+        self.sent.append(text)
+        for char in text:
+            step = {
+                "h": (0, -1), "j": (1, 0), "k": (-1, 0), "l": (0, 1),
+                "y": (-1, -1), "u": (-1, 1), "b": (1, -1), "n": (1, 1),
+            }.get(char)
+            if step is None:
+                continue
+            target = (self.hero[0] + step[0], self.hero[1] + step[1])
+            if self._passable(*target):
+                self.hero = target
+                if self.pager_at is not None and self.hero == self.pager_at:
+                    self.msg = "You are becoming hungry.--More--"
+                    self.pager_at = None
+                if self.prompt_at is not None and self.hero == self.prompt_at:
+                    self.msg = "In what direction? "
+                    self.prompt_at = None
+
+
+CORRIDOR = ["----------", "|........|", "----------"]
+
+
+def wire(client, pane, monkeypatch):
+    monkeypatch.setattr(client, "_capture_screen", pane.capture)
+    monkeypatch.setattr(client, "_type", pane.type)
+    monkeypatch.setattr(client, "_send_keys", pane.send_keys)
+    monkeypatch.setattr(client, "_wait_until_stable", lambda **kw: pane.capture()[1])
+    client.session_name = "fake-session"
+
+
+def test_route_stops_at_the_blocked_key_and_types_nothing_after(client, monkeypatch):
+    pane = FakePane(CORRIDOR, (1, 3))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+
+    state = client.send_command("lllllll")  # seven east; only five fit
+
+    assert pane.hero == (1, 8)  # the corridor ends at the east wall
+    typed = [s for s in pane.sent if s == "l"]
+    assert len(typed) == 6, "the key past the block must never be typed"
+    note = state.get("move_result", "")
+    assert "consumed 6 of 7 keys" in note
+    assert "did not move you" in note
+    assert "wall" in note
+    assert client.maps[1].player_world_pos[1] == 5  # world col 8 at anchor screen col 3
+
+
+def test_pager_mid_route_is_drained_and_the_route_finishes(client, monkeypatch):
+    pane = FakePane(CORRIDOR, (1, 2))
+    pane.pager_at = (1, 4)
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+
+    state = client.send_command("llll")
+
+    assert pane.hero == (1, 6), "the route must resume after draining the pager"
+    assert ("Space",) in pane.sent, "only Space turns this build's pager"
+    note = state.get("move_result", "")
+    assert "cleared 1 waiting message(s)" in note
+    assert "consumed" not in note, "the route completed; nothing to stop for"
+    assert state.get("pager_diff"), "the turned page must reach the agent"
+
+
+def test_prompt_before_a_key_pauses_the_route(client, monkeypatch):
+    pane = FakePane(CORRIDOR, (1, 2))
+    pane.prompt_at = (1, 3)
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+
+    state = client.send_command("llll")
+
+    typed = [s for s in pane.sent if s == "l"]
+    assert len(typed) == 1, "no route key may be typed into a live prompt"
+    note = state.get("move_result", "")
+    assert "stopped before key 2" in note
+    assert "In what direction" in note
+    assert state["awaiting"]["kind"] == "direction"
+
+
+def test_bumping_into_another_at_blocks_instead_of_swapping(client, monkeypatch):
+    """A shopkeeper walks up while the hero watches, then `ll` tries to walk
+    into her: the game refuses, and the map must refuse too - the D3 tragedy
+    was the map deciding the hero *was* the standing @ after such a bump."""
+    rows = ["-------------", "|...........|", "-------------"]
+    pane = FakePane(rows, (1, 5))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+    assert client.maps[1].player_world_pos == (0, 0)
+
+    # the shopkeeper arrives one tile east, in plain sight
+    pane.rows[1][6] = "@"
+    client.get_state()
+    assert client.maps[1].player_world_pos == (0, 0), "an adjacent @ must not move us"
+
+    state = client.send_command("ll")
+
+    assert pane.hero == (1, 5), "the game refused the step"
+    assert client.maps[1].player_world_pos == (0, 0), "the map must not swap us"
+    note = state.get("move_result", "")
+    assert "did not move you" in note
+    assert "something is standing there (@)" in note
+    assert [s for s in pane.sent if s == "l"] == ["l"], "second key never typed"
+    keeper = client.maps[1].get_tile(0, 1)
+    assert keeper is None or not keeper.solid, "the shopkeeper is not a wall"
+
+
+def test_single_key_bump_does_not_move_the_hero_onto_the_keeper(client, monkeypatch):
+    rows = ["-------------", "|...........|", "-------------"]
+    pane = FakePane(rows, (1, 5))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+    pane.rows[1][6] = "@"
+    client.get_state()
+
+    state = client.send_command("l")
+
+    assert client.maps[1].player_world_pos == (0, 0)
+    note = state.get("move_result", "")
+    assert "went nowhere" in note and "(@)" in note
+
+
+# --------------------------------------------------------------------------- #
+#  what the reply says: awaiting, stairs ledger, no-exit
+# --------------------------------------------------------------------------- #
+
+
+def test_awaiting_classifies_who_owns_the_keyboard(client):
+    assert client._awaiting(["hi there.--More--", "", *MAP_ROWS_])["kind"] == "pager"
+    assert (
+        client._awaiting(["In what direction?", "", *MAP_ROWS_])["kind"]
+        == "direction"
+    )
+    assert (
+        client._awaiting(
+            ["There is a chest here; force its lock? [ynq]", "", *MAP_ROWS_]
+        )["kind"]
+        == "ynq"
+    )
+    clean = ["", "", *MAP_ROWS_]
+    assert client._awaiting(clean) is None
+    menu = [
+        "",
+        "Pick an object from your inventory:",
+        "+----------------+",
+        "a - a +0 katana",
+        "b - a potion of sickness",
+        "+----------------+",
+        "St:15 Dx:18",
+        "Dlvl:1",
+    ]
+    assert client._awaiting(menu)["kind"] == "menu"
+
+
+def test_no_exit_warning_when_a_mapped_level_has_no_way_down(client, monkeypatch):
+    rows = [
+        "-------",
+        "|.....|",
+        "|.....|",
+        "|..@..|",
+        "|.....|",
+        "|.....|",
+        "-------",
+    ]
+    pane = FakePane(rows, (3, 3))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+    state = client.get_state()
+
+    assert state["map_summary"]["frontier_cells"] == 0
+    assert state["map_summary"]["downstairs"] == []
+    assert "NO EXIT" in state["exit_warning"]
+    assert "never been searched" in state["exit_warning"]
+    assert "WARNING: NO EXIT" in _format_state(state)
+
+
+def test_a_level_with_stairs_never_shouts_no_exit(client, monkeypatch):
+    rows = [
+        "-------",
+        "|....>|",
+        "|..@..|",
+        "|.....|",
+        "-------",
+    ]
+    pane = FakePane(rows, (2, 3))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+    state = client.get_state()
+
+    assert "exit_warning" not in state
+    assert "stairs down (-1,2)" in _format_state(state)
+
+
+def test_format_state_lists_every_down_stair():
+    state = {
+        "status": "playing",
+        "screen": "",
+        "map": "x",
+        "map_summary": {
+            "remembered_tiles": 9,
+            "visited_tiles": 3,
+            "frontier_cells": 0,
+            "downstairs": [[-3, 4], [1, 2]],
+        },
+    }
+    out = _format_state(state)
+    assert "(-3,4)" in out and "(1,2)" in out
+
+
+def test_search_command_marks_the_walls_it_covered(client, monkeypatch):
+    rows = ["-------", "|.....|", "|..@..|", "-------"]
+    pane = FakePane(rows, (2, 3))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+    dungeon_map = client.maps[1]
+    assert dungeon_map.searched == set()
+
+    client.send_command("2s")
+
+    assert dungeon_map.searched, "a finished search must hit the ledger"
+    # and 's' alone is a search too, while 's' inside a command is not
+    client.send_command("20s")
+    wider = set(dungeon_map.searched)
+    assert wider == dungeon_map.searched
+
+
+# --------------------------------------------------------------------------- #
+#  window and plumbing hygiene
+# --------------------------------------------------------------------------- #
+
+
+def test_a_dense_shop_screen_is_still_the_map(client):
+    """Shelves and stock are dense but no *words* - the old junk budget
+    refused such screens, and shop memory went stale exactly where a run
+    needed it."""
+    lines = [
+        "",
+        "Tefenni's used armor dealership.",
+        " ---------------- ",
+        " |[[[[[[[[[[[[[| ",
+        " |.....$..)....| ",
+        " |......@......| ",
+        " |$)($)%(*#$%.| ",
+        " ---------------- ",
+        "St:12 Dx:15      ",
+        "Dlvl:3 $:9 HP:12(12)",
+    ]
+    assert client._map_window(lines) is not None
+    # the hero's screen cell is the committed one, not the first '@' found
+    load(client, lines)
+    assert client.maps[3].player_world_pos == (0, 0)
+
+
+def test_restore_state_picks_the_newest_file(tmp_path, monkeypatch):
+    import json
+    import os
+
+    monkeypatch.setattr(NetHackClient, "STATE_FILE_PREFIX", str(tmp_path / "nh_"))
+    old = tmp_path / "nh_aaa.json"
+    new = tmp_path / "nh_zzz.json"
+    old.write_text(json.dumps({"session_name": "nethack_old"}))
+    new.write_text(json.dumps({"session_name": "nethack_new"}))
+    os.utime(old, (0, 0))
+    os.utime(new, (1000, 1000))
+
+    client = NetHackClient(restore=False)
+    client._restore_state()
+    assert client.session_name == "nethack_new"
+    assert client.state_file == str(new)
+
+
+def test_instructions_send_force_to_chests_and_kicks_to_doors():
+    """#force in this build only ever forces a box at your feet (src/lock.c
+    carries a literal TODO about doors) - telling agents to '#force' a locked
+    door produced a no-op and a lost run's worth of confusion."""
+    from nethackmcp.server import SERVER_INSTRUCTIONS
+
+    assert "box you are standing on" in SERVER_INSTRUCTIONS
+    assert "`#force` it" not in SERVER_INSTRUCTIONS
+    assert "one key at a time" in SERVER_INSTRUCTIONS
+    assert "AMBIGUOUS" in SERVER_INSTRUCTIONS
+    assert "NO EXIT" in SERVER_INSTRUCTIONS
+
+
+def test_a_successful_single_step_gets_no_move_note(client, monkeypatch):
+    """The MOVE note must judge the step against the *merged* position:
+    reading the pre-merge map reported every successful single key as
+    "went nowhere" - and a false block on drawn '#' marks the hero's own
+    new tile solid."""
+    pane = FakePane(CORRIDOR, (1, 3))
+    wire(client, pane, monkeypatch)
+    load(client, pane.capture()[1])
+
+    state = client.send_command("l")
+
+    assert pane.hero == (1, 4)
+    assert client.maps[1].player_world_pos == (0, 1)
+    assert "move_result" not in state
+    tile = client.maps[1].get_tile(0, 1)
+    assert tile is not None and not tile.solid and tile.visited
+
+
+def test_the_live_d3_shop_scene_never_anchors_on_the_shopkeeper(client):
+    """The real scene that bricked the wizard's run, as captured: hero in the
+    cave south of Tefenni's door, shopkeeper visible inside, and a D3 memory
+    scrambled enough by the old algorithm that the keeper's cell explains the
+    screen just as cleanly as ours.  The merge must pick the cave `@`, keep
+    the alignment it has, and stay there through every re-read - the old code
+    flipped between the two readings and duplicated the room out from under
+    the hero."""
+    import json
+
+    from nethackmcp.map import DungeonMap
+
+    state = json.loads((FIXTURES / "shop_two_at_state.json").read_text())
+    lines = (FIXTURES / "shop_two_at_screen.txt").read_text().rstrip("\n").split("\n")
+    dungeon_map = DungeonMap.from_dict(state["maps"]["3"])
+    client.current_level = 3
+    client.maps[3] = dungeon_map
+
+    window = client._map_window(lines)
+    assert window is not None, "the shop screen must read as a map"
+    cands = client._player_candidates(lines, window)
+    assert len(cands) == 2, "the capture really shows two @ glyphs"
+
+    home = dungeon_map.player_world_pos  # (4, -3): the stale committed spot
+    assert home == (4, -3), "fixture premise: memory is out of date"
+    for _ in range(4):
+        info = client.update_map(lines)
+        assert info["updated"]
+        assert info["alignment_status"] == "locked"
+        # never the shopkeeper: the cave @ stands at world (3, -1) on this screen
+        assert dungeon_map.player_world_pos != (1, 0)
+        assert dungeon_map.dungeon_offset == (-5, -73), "the alignment drifted"
+    # recovery, not stasis: the merge re-anchors onto the cave @ and stays put
+    assert dungeon_map.player_world_pos == (3, -1)
+
+    keeper = dungeon_map.get_tile(1, 0)
+    assert keeper is None or not keeper.solid, "a shopkeeper is not a wall"
+    assert keeper is None or not keeper.visited, "we never walked into the shop"

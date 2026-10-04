@@ -49,12 +49,26 @@ way, and all surprising:
   are also transient beam / explosion / swallow glyphs, drawn **over rockwall
   too**: they say nothing about the tile.
 - `%` is a food item, `k` a kobold, `:` a lizard - a monster or item glyph is
-  proof of ground, but only because it cannot live in rockwall.
+  proof of ground, but only because it cannot live in rockwall. The `@` glyph
+  is **not**: shopkeepers, pirates and human-shaped statues draw `@` too
+  (`MONSYM` HUMAN), and `I` (last *heard* position) is drawn over rockwall and
+  proves nothing.
+- `#force` only ever forces the lock of a **box at your feet** (`doforce()` in
+  `src/lock.c` - it asks `[ynq]`, needs a proper melee weapon, and carries a
+  literal TODO about doors). There is **no** direction prompt to answer. A
+  locked door is opened by kicking (`^D`+dir).
+- `#terrain` exists in this build (`doterrain` in `src/cmd.c`): it draws the
+  level as the game itself remembers it - the cross-check when map and world
+  disagree.
 - `#` is this build's extended-command key; there is **no** `#knock`.
 - `--More--` is dismissed by Space only - letters do nothing, so a movement key
-  sent while the pager is up is lost. The server drains it before sending.
+  sent while the pager is up is lost. The server drains it before sending, and
+  walks multi-key routes one verified key at a time so a message mid-route can
+  no longer eat the tail.
 - NetHack refuses a **diagonal** step into or out of an intact doorway
-  (`has_door_leaf()` gating `step_ok()`), so routes must not plan one.
+  (`has_door_leaf()` gating `step_ok()`), so routes must not plan one. It also
+  refuses to walk onto a tile an `@` stands on: a step towards a visible `@` is
+  a bump, never an exchange of places.
 
 ## Live verification
 
@@ -86,20 +100,31 @@ calling it. The `load()` helper mirrors this.
 1. A blank is never stored as a wall.
 2. A `?` next to the player resolves the moment it is next to the player - into
    drawn terrain, into ground under an occupant, or into confirmed `X`.
+   A *guessed* tile that shows blank next to the player retires the guess first
+   (the occupant was a transient effect over rockwall) and then confirms `X`;
+   a stale guess never counts as a conflict against an alignment.
 3. Nothing is `?` unless a reachable path leads adjacent to it.
 4. **The screen decides the alignment; the keys only say where to start looking.**
    Search rings outward from the key-implied position and the previous offset, a
-   candidate must cover enough remembered memory to be trusted, and the first
-   conflict-free alignment wins.
+   candidate must cover enough remembered memory to be trusted, and a clean fit
+   wins - but a *tie keeps the offset already held*: two symmetric readings must
+   never flip the map between them (the D3 shop brick). When the map would have
+   to *move* onto an alignment another reading explains equally well, the merge
+   reports `alignment_status: ambiguous` and touches no memory.
 5. Remembered terrain is not erased by a blank. A disagreement is reported to the
    player and the screen is merged without overwriting memory (memory is only
    rewritten when conflicts are zero).
 6. Each level keeps its own map and origin; a level never seen anchors at the
    player and keeps that origin as the viewport slides.
-
-Known loose end, marked in `tile_matches`: a *guessed* tile (learned under a
-monster or item, never drawn as terrain) that later draws blank still counts as a
-conflict. It should retire the guess instead.
+7. **The hero is the `@` that memory and continuity agree is moving.** Every
+   `@` in the window is offered to the merge as a candidate; the reading kept
+   is the one that contradicts memory least, and among equals the one on the
+   committed alignment at the position the keys imply. A step towards an `@`
+   that was already drawn there is a bump - the game refuses the tile and the
+   map must not put the hero on it. `I` is not an occupant (sound reaches
+   through rockwall) and is never remembered as ground.
+8. Multi-key routes are verified one key at a time: nothing is typed after a
+   key the game did not execute, and the MOVE note counts what was consumed.
 
 ## How to work here
 

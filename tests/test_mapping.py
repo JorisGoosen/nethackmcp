@@ -24,6 +24,7 @@ from nethackmcp.map import (
     DungeonMap,
     Tile,
     route_displacement,
+    route_tokens,
     tile_matches,
 )
 
@@ -894,3 +895,212 @@ def test_state_round_trip():
     assert restored.get_tile(-5, 7).solid
     assert restored.get_tile(0, 4).door_closed  # a shut door stays shut
     assert restored.get_tile(-1, -1).trap
+
+
+# --------------------------------------------------------------------------- #
+#  route parsing for key-by-key walking
+# --------------------------------------------------------------------------- #
+
+
+def test_route_tokens_splits_directions_and_door_openers():
+    assert route_tokens("hhb") == ["h", "h", "b"]
+    assert route_tokens("hhol") == ["h", "h", "ol"]
+    assert route_tokens("ol") == ["ol"]
+
+
+def test_route_tokens_refuses_anything_that_is_not_walking():
+    assert route_tokens("olo") is None  # a lone 'o' cannot end a route
+    assert route_tokens("20s") is None  # a count repeats an unknown number of times
+    assert route_tokens("H") is None  # a run key travels until it likes
+    assert route_tokens("dh") is None  # 'd' is drop, not a step south
+    assert route_tokens("") is None
+
+
+# --------------------------------------------------------------------------- #
+#  two @ on one screen: who is the hero
+# --------------------------------------------------------------------------- #
+
+# two rooms joined by a doorway; shopkeeper stands in the right-hand room
+TWO_AT_SCREEN = [
+    "---------------",
+    "|.....|.......|",
+    "|.....+...@...|",
+    "|..@..|.......|",
+    "|.....|.......|",
+    "---------------",
+]
+HERO_AT = (3, 3)
+KEEPER_AT = (2, 10)
+
+
+def build_two_at():
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.apply_screen(
+        TWO_AT_SCREEN, HERO_AT, (0, len(TWO_AT_SCREEN) - 1),
+        player_candidates=[HERO_AT],
+    )
+    return dungeon_map
+
+
+def test_the_at_that_memory_and_keys_agree_on_is_the_hero():
+    """A shopkeeper above-left of the hero is the first @ on screen and used
+    to be *the* @ - memory and continuity must pick the real one anyway."""
+    dungeon_map = build_two_at()
+    home = dungeon_map.player_world_pos
+    assert dungeon_map.get_tile(*home).visited
+    # re-read the very same screen with both @ offered: nothing moved, so
+    # nothing moves - continuity with the committed position decides
+    info = dungeon_map.apply_screen(
+        TWO_AT_SCREEN, KEEPER_AT, (0, len(TWO_AT_SCREEN) - 1),
+        player_candidates=[KEEPER_AT, HERO_AT],
+    )
+    assert info["alignment_status"] == "locked"
+    assert dungeon_map.player_world_pos == home
+
+
+def test_alternating_expectations_never_walk_the_hero_onto_the_keeper():
+    """The D3 shop brick: every re-read flipped YOU ARE between two readings.
+    A swallowed key must not be able to teleport the hero onto the standing
+    @ - the sticky alignment keeps its ground through a lying expectation."""
+    dungeon_map = build_two_at()
+    home = dungeon_map.player_world_pos
+    remembered = dungeon_map.remembered_count()
+    for expected in (
+        (home[0], home[1] + 1),
+        home,
+        (home[0], home[1] + 1),
+        None,
+    ):
+        dungeon_map.apply_screen(
+            TWO_AT_SCREEN, KEEPER_AT, (0, len(TWO_AT_SCREEN) - 1),
+            expected_world=expected,
+            player_candidates=[KEEPER_AT, HERO_AT],
+        )
+        assert dungeon_map.player_world_pos == home
+    assert dungeon_map.remembered_count() == remembered  # and no duplicated room
+
+
+def test_a_screen_that_cannot_tell_two_at_apart_says_so():
+    """Hero teleported left and a monster @ arrived on the right: from this
+    one screen both readings are perfect and continuity cannot pick.  The
+    merge must refuse to rewrite memory and report both candidates."""
+    cave = ["#########", "#########", "#########"]
+    start = [cave[0], "####@####", cave[2]]  # hero at (1, 4)
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.apply_screen(start, (1, 4), (0, 2), player_candidates=[(1, 4)])
+    home = dungeon_map.player_world_pos
+    remembered = dungeon_map.remembered_count()
+
+    twins = [cave[0], "###@#@###", cave[2]]  # @ at (1, 3) and (1, 5)
+    info = dungeon_map.apply_screen(
+        twins, (1, 3), (0, 2), player_candidates=[(1, 3), (1, 5)]
+    )
+    assert info["alignment_status"] == "ambiguous"
+    assert dungeon_map.player_world_pos == home  # committed position kept
+    assert dungeon_map.remembered_count() == remembered  # memory untouched
+    assert len(info["hero_candidates"]) == 2
+
+    # the next look settles it: one @ is left where it moved to, memory
+    # re-anchors on it and the hero follows
+    stepped = [cave[0], "##@######", cave[2]]  # single @ at (1, 2)
+    dungeon_map.apply_screen(stepped, (1, 2), (0, 2), player_candidates=[(1, 2)])
+    assert dungeon_map.player_world_pos[1] == home[1] - 2
+
+
+# --------------------------------------------------------------------------- #
+#  what is *not* evidence of ground
+# --------------------------------------------------------------------------- #
+
+
+def test_the_last_heard_marker_is_not_ground():
+    """'I' marks where an unseen monster was heard - sound reaches through
+    rockwall - so it must never become remembered floor."""
+    dungeon_map = build(["-------", "|..@.I|", "-------"], player=(1, 3))
+    tile = dungeon_map.get_tile(1 - 1, 5 - 3)  # screen (1,5) -> world (0, 2)
+    assert tile is None or (not tile.memory and not tile.solid)
+
+
+def test_a_wrong_guess_retires_instead_of_becoming_a_conflict():
+    """A '*' zap drawn over rockwall guessed the tile as floor.  Standing
+    next to it and seeing blank now settles it: no conflict, guess retired,
+    confirmed X."""
+    dungeon_map = build(["---------", "|..@*...|", "---------"], player=(1, 3))
+    world = (1 - 1, 4 - 3)  # screen (1, 4) -> world (0, 1)
+    tile = dungeon_map.get_tile(*world)
+    assert tile is not None and tile.guessed
+
+    # the beam gone, the hero still adjacent: the tile draws nothing, while
+    # the ground on the other side of it is still drawn and still matches
+    lines = ["---------", "|..@ ...|", "---------"]
+    info = dungeon_map.apply_screen(lines, (1, 3), (0, 2))
+    assert info["conflicts"] == 0  # the stale guess contradicts nothing
+    tile = dungeon_map.get_tile(*world)
+    assert not tile.guessed
+    assert tile.solid  # adjacent and blank: rockwall, confirmed
+
+
+# --------------------------------------------------------------------------- #
+#  stairs and searches: ledgers, not single slots
+# --------------------------------------------------------------------------- #
+
+
+def test_every_stair_seen_is_remembered():
+    dungeon_map = build(
+        [
+            "-----------",
+            "|..>......|",
+            "|....@....|",
+            "|..<......|",
+            "-----------",
+        ]
+    )
+    dungeon_map.observe(0, 6, DOWN)  # a second down stair found later
+    assert len(dungeon_map.downstairs) == 2
+    assert dungeon_map.upstairs_pos is not None
+
+
+def test_stair_ledger_round_trips_and_reads_old_state_files():
+    dungeon_map = DungeonMap()
+    dungeon_map.observe(0, 0, DOWN)
+    dungeon_map.observe(3, 4, DOWN)
+    dungeon_map.observe(2, 2, UP)
+    dungeon_map.mark_searched_around((2, 2))
+    restored = DungeonMap.from_dict(dungeon_map.to_dict())
+    assert restored.downstairs == {(0, 0), (3, 4)}
+    assert restored.upstairs == {(2, 2)}
+
+    legacy = {
+        "level": 1,
+        "player_world_pos": None,
+        "dungeon_offset": [0, 0],
+        "downstairs_pos": [7, 8],
+        "upstairs_pos": None,
+        "tiles": {},
+    }
+    assert DungeonMap.from_dict(legacy).downstairs == {(7, 8)}
+
+
+def test_search_ledger_covers_the_walls_around_you():
+    dungeon_map = build(ROOM_SCREEN)
+    before = len(dungeon_map.unsearched_wall_targets())
+    assert before > 0
+    # stand against the top wall and search: the three wall tiles touching
+    # that spot are covered; the rest of the room's walls are not
+    by_the_wall = (-1, 0)  # one row under the top wall, world coords
+    assert dungeon_map.mark_searched_around(by_the_wall) >= 3
+    after = dungeon_map.unsearched_wall_targets()
+    assert len(after) < before
+    summary = dungeon_map.describe()
+    assert summary["unsearched_walls"] == len(after)
+    assert DungeonMap.from_dict(dungeon_map.to_dict()).searched == dungeon_map.searched
+
+
+def test_standing_on_a_tile_undoes_a_false_solid():
+    """'X' means the game refused us here; the hero standing on it is proof
+    to the contrary, whatever an earlier wrong reading remembered."""
+    dungeon_map = DungeonMap()
+    dungeon_map.mark_solid(5, 5)
+    assert dungeon_map.get_tile(5, 5).solid
+    dungeon_map.visit(5, 5)
+    assert not dungeon_map.get_tile(5, 5).solid
+    assert dungeon_map.get_tile(5, 5).visited

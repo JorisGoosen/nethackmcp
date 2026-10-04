@@ -52,7 +52,10 @@ next to this one.  This build plays with vi keys (`number_pad` off).  The easily
 guessed ones: `e` eat but `E` engrave, `q` drink but `Q` choose ammo, `t` throw
 but `T` take off armor, `F`+dir fights (`f`+dir fires the quiver), `Z` casts a
 spell (`m` is the move-without-picking-up prefix), `_` travels, `#herecmdmenu`
-lists what you can do here - and there is no `#knock`.
+lists what you can do here - and there is no `#knock`.  `#force` does not force
+doors at all in this build (`src/lock.c` carries the TODO): it forces the lock
+of a box **at your feet**, with a proper weapon, after asking `[ynq]`; a locked
+door yields to the kick (`^D`+dir).
 
 ## The map
 
@@ -96,7 +99,10 @@ Four rules make it trustworthy to navigate by:
 
 Terrain learned from a monster or an item is stored as *guessed*: the tile is
 ground, but nothing has ever drawn it as floor, and a guess is worth less than
-what you walked on.
+what you walked on.  A guess that stands next to you and still draws blank was
+wrong - transient effects (a zap's beam) are drawn over rockwall too - so it
+retires and the confirmed `X` takes its place.  `I` is never evidence of
+anything: it marks where an unseen monster was last *heard*.
 
 `FRONTIER` lists, per unrevealed area, the tile to stand on, the steps and keys
 to get there and the one key that pokes the area into reality:
@@ -108,7 +114,11 @@ to get there and the one key that pokes the area into reality:
 
 Sending route+probe as a single `nethack_move` therefore always learns
 something.  Routes carry `o<dir><dir>` where they must open a shut door on the
-way, and warn when the way in is locked or a trap lies on the path.
+way, and warn when the way in is locked or a trap lies on the path.  A route is
+walked and verified **one key at a time**: a pager or prompt found mid-route is
+drained (or the route stops in front of it), and the first key the game refuses
+stops the rest - the `MOVE` note then names how many keys were consumed and why
+it stopped.
 
 ## Where the screen meets memory
 
@@ -120,8 +130,19 @@ message cleared.
 
 * the search starts where the keys say the hero should be, then where the screen
   sat last time, and works outward one tile at a time;
-* the first alignment that contradicts nothing wins - it is the nearest one, so
-  there is nothing left to weigh;
+* the first alignment that contradicts nothing wins - and a tie keeps the
+  alignment you already had: a screen that fits two places equally (a symmetric
+  room) must not move the map to whichever ring order reached first, because a
+  map that flips between two clean readings poisons every decision built on it.
+  When the map *would* move onto an alignment another reading explains just as
+  well, the reply says `AMBIGUOUS` and memory is left alone;
+* which `@` is the hero is decided the same careful way: shopkeepers, pirates
+  and human-shaped statues are drawn `@` too, so each visible `@` is tried as
+  the anchor and the reading that contradicts memory least - then continues
+  where you were - wins.  A step towards an `@` that was already standing there
+  is a bump, not a swap: the game refuses the tile and so does the map.  If two
+  candidates truly tie, the reply names both positions and one single-key move
+  resolves them: the `@` that moves is you;
 * an alignment only earns trust by being *tested*.  One that slides the window off
   the edge of the remembered level contradicts nothing simply because it looks at
   nothing, so candidates covering too little are thrown away;
@@ -136,7 +157,17 @@ message cleared.
   conflicts, memory keeps its shape and only genuinely new tiles are learned.
 
 Each level has its own map and its own origin, and a level's memory survives
-going downstairs and back up.
+going downstairs and back up.  Staircases are a **ledger** per level (a level
+can hold two of either), and searches are remembered too: when the frontier
+empties and no `>` has ever been drawn, the reply carries a `NO EXIT` warning
+with the number of wall tiles that touch reachable ground and have never been
+searched - the checklist that turns a level-wide dead end into bounded work.
+
+`AWAITING` appears whenever something other than you owns the keyboard -
+`--More--`, a yes/no question, a direction prompt, a menu - and says what is
+safe to send.  This matters because a prompt *eats* what you type at it: the
+tty pager destroys every key that is not Space, and menu letters are not
+movement keys.
 
 Screens that are not the dungeon (menus, prompts, death screens) are recognised
 and never read as terrain, and the map window is *detected* rather than assumed:

@@ -39,6 +39,8 @@ from nethackmcp.map import (
     VISIBLE_TERRAIN,
     DungeonMap,
     route_displacement,
+    route_tokens,
+    tile_matches,
 )
 
 SERVER_INSTRUCTIONS = """\
@@ -61,8 +63,17 @@ tmux session and keeps a *memory map* of every level for you.
 - **Eat**: `e`   **Drink**: `q`   **Read**: `r`   **Engrave**: `E`   **Throw**: `t`
 - **Zap wand**: `z`   **Cast spell**: `Z`   **Fire ammo**: `f`
 - **Open door**: `o`+direction   **Close door**: `c`+direction   **Apply tool**: `a`
-- **Kick**: `^D`   **Force a lock**: `#force`   (this build has **no** `#knock`)
-- **Search** for secret doors and traps: `s` (stand next to the wall, repeat)
+- **Kick**: `^D`+direction - the way to break a **locked or stuck door**: one or two
+  calls per kick, 1-6 kicks usually finish it and leave `%` rubble where the door was
+- **Force a chest**: `#force` - forces the lock of a **box you are standing on**,
+  after asking you `[ynq]`, and only with a proper melee weapon wielded.  It never
+  asks a direction and does nothing at all to doors in this build: for a locked
+  door, kick it.  (this build has **no** `#knock`)
+- **Search** for secret doors and traps: `s` (stand next to the wall, repeat; a
+  count repeats it - `2s`, `20s`)
+- **The game's own map**: `#terrain` draws the level as NetHack itself remembers
+  it - the cross-check to run when this server's map and the world disagree; it
+  opens a menu and pages, answer each with its own call
 - **Look**: `:` here, `;` somewhere else, `/` what a symbol is, `^` an adjacent trap
 - **Travel**: `_` lets NetHack pathfind to a spot you pick on the map
 - **Menus of what you can do**: `#herecmdmenu`, `#therecmdmenu`
@@ -86,8 +97,9 @@ Letters do not dismiss `--More--` in this build, which is why that matters.
 remembers about each), `YOU ARE` (your world position and what you stand on),
 `MAP` (accumulated memory - **always shown**, even when the screen is a menu;
 the map keeps whatever it last knew), `FRONTIER` (the places still worth
-exploring, with the keys to reach them) and `MOVE` when your key did not do
-what you asked.
+exploring, with the keys to reach them), `AWAITING` (when something owns your
+keystrokes: a pager, a yes/no question, a direction prompt, a menu - and what
+is safe to send), and `MOVE` when your command did not do what you asked.
 
 ### Map glyphs
 
@@ -101,7 +113,7 @@ an open doorway `'` like any other.
 
 | | |
 |---|---|
-| `@` | you |
+| `@` | you - shopkeepers and some statues draw `@` too; the map follows the one that moves when you do |
 | `.` | floor |
 | `#` | cave floor / corridor (`#` is also iron bars and trees: a bump settles it) |
 | `+` | doorway, door **shut** - `o`+direction opens it, `^D` kicks it in |
@@ -132,9 +144,26 @@ teleport, or the message window changing height and sliding the whole dungeon a
 row.  When a key did not do what it was asked, the `MOVE` note says so and names
 what was in the way.
 
+Which `@` on the screen is you is a question, not an assumption: shopkeepers,
+pirates and human-shaped statues are drawn `@` too.  When several are visible
+each is tried as the hero, and the reading that contradicts memory least and
+continues where you were wins.  A tie is reported, not guessed: on
+`AMBIGUOUS: ...` the map was deliberately **not** rewritten, both candidate
+positions are named, and one single-key move resolves it - the `@` that moves
+is you.  Two alignments that explain memory equally well are reported the same
+way, and an alignment never moves just because the ring order reached another
+clean fit first: ties keep the reading you already had.
+
 If a screen disagrees with memory you get a warning saying how many remembered
 tiles disagree.  Believe the screen in that moment: the map around you may be
 stale until the alignment settles, so re-read it before trusting a long route.
+
+If the frontier comes back empty and no `>` has ever been drawn on the level,
+you get a `NO EXIT` warning with the count of wall tiles that touch reachable
+ground and have never been searched - a checklist, not a dead end.  Search each
+(`2s` standing next to it), cross-check the level with `#terrain` and
+`#lookaround`, and if it stays dry go back up (`<`) and hunt a shaft instead of
+orbiting the same walls.
 
 ## Coordinates and routes
 
@@ -149,7 +178,13 @@ part of that `?` blob; `<probe>` is the one key that makes a `?` real from there
 so sending route+probe as a single `nethack_move` always learns something
 (`(you are there)` means you already overlook it).  A route carries `o<dir><dir>`
 where it has to open a shut door on the way.  If a door will not open it is
-locked: `#force` it, kick it (`^D`), or search (`s`) for a secret way round.
+locked: kick it (`^D`+direction), or search (`s`) for a secret way round.
+
+A route is walked and **verified one key at a time**: before each key the server
+checks that no pager or prompt owns the input, and after each key that the `@`
+really moved where you asked.  The first key the game does not execute stops the
+route - the remaining keys are never typed - and the `MOVE` note says after how
+many of them you stopped and why.  Nothing you send is silently eaten any more.
 
 Routes never plan a **diagonal** step into or out of an intact doorway: NetHack
 refuses those, so approach a door from the side it opens onto.
@@ -310,6 +345,62 @@ class NetHackClient:
             return message
         return ""
 
+    def _awaiting(self, screen_lines: list[str]) -> dict[str, Any] | None:
+        """What owns the keyboard right now, if anything - and what is safe.
+
+        Movement keys are not neutral while a prompt or a menu is up: they
+        *answer* it - `d` drops something instead of stepping south, Enter at
+        a direction prompt means "never mind", letters at `--More--` are
+        destroyed (``more()`` -> ``xwaitforspace``, win/tty/topl.c).  Say what
+        is waiting so a wrong key costs a note, not a run.
+        """
+        joined = "\n".join(screen_lines)
+        if "--More--" in joined:
+            return {
+                "kind": "pager",
+                "question": "--More--",
+                "reply": "Space turns the page; nethack_move drains every page for you first",
+                "note": (
+                    "messages are waiting behind --More--; a 'nethack_move' clears "
+                    "them automatically before your command runs"
+                ),
+            }
+        question = self._open_prompt(screen_lines)
+        if question:
+            if "In what direction" in question:
+                return {
+                    "kind": "direction",
+                    "question": question,
+                    "reply": "exactly one of h j k l y u b n, sent alone; Escape or Enter gives up",
+                    "note": f"the game waits for a direction: {question}",
+                }
+            bracket = re.search(r"\[([a-zA-Z/]+)\]", question)
+            if bracket:
+                letters = sorted(set(bracket.group(1).replace("/", "")))
+                kind = "ynq" if "q" in letters else "yn"
+                return {
+                    "kind": kind,
+                    "question": question,
+                    "reply": "exactly one of " + " ".join(letters) + ", sent alone",
+                    "note": f"the game is waiting for an answer: {question}",
+                }
+            return {
+                "kind": "prompt",
+                "question": question,
+                "reply": "the letter or line the question asks for, then re-read the screen",
+                "note": f"the game is waiting for an answer: {question}",
+            }
+        if self._map_window(screen_lines) is None and screen_lines:
+            body = "".join(screen_lines)
+            if "+---" in body or len(re.findall(r"[A-Za-z]{3,}", body)) >= 4:
+                return {
+                    "kind": "menu",
+                    "question": "",
+                    "reply": "a menu letter to choose, Escape to close; movement keys are letters here",
+                    "note": "a menu is open - keys answer it, they do not move the hero",
+                }
+        return None
+
     def _drain_more(self, screen_lines: list[str], limit: int = 15) -> list[str]:
         """Page through pending messages so the real command lands.
 
@@ -366,6 +457,27 @@ class NetHackClient:
         return None
 
     @staticmethod
+    def _player_candidates(
+        screen_lines: list[str], map_rows: tuple[int, int]
+    ) -> list[tuple[int, int]]:
+        """Every ``@`` drawn inside the map window, top-left first.
+
+        One of them is the hero.  Shopkeepers, pirates and human-shaped statues
+        are drawn ``@`` as much as you are (``include/defsym.h``, MONSYM HUMAN),
+        and anchoring the map on the wrong one slides the whole level sideways -
+        which is how one shop room bricked a run.  Which candidate *is* the hero
+        is a question for memory and the keys to answer (``DungeonMap``
+        ``apply_screen``), not for ``str.find``.
+        """
+        first, last = map_rows
+        cells: list[tuple[int, int]] = []
+        for srow in range(max(first, 0), min(last, len(screen_lines) - 1) + 1):
+            for scol, char in enumerate(screen_lines[srow]):
+                if char == "@":
+                    cells.append((srow, scol))
+        return cells
+
+    @staticmethod
     def _status_row(screen_lines: list[str]) -> int | None:
         # get_strength_str() (src/botl.c) writes St as 15, 18/51, 18/** or 100+,
         # so the optional /xx suffix must be part of the match: missing it makes
@@ -407,14 +519,16 @@ class NetHackClient:
         last = status - 1
         if last < first:
             return None
-        player = cls._find_player(screen_lines)
-        if player is None or not (first <= player[0] <= last):
+        candidates = cls._player_candidates(screen_lines, (first, last))
+        if not candidates:
             return None
         body = "".join(screen_lines[first : last + 1])
-        junk = sum(
-            1 for ch in body if ch not in VISIBLE_TERRAIN and not ch.isspace() and ch != "@"
-        )
-        if junk > 40:
+        # what makes a menu a menu is that it spells words; the dungeon never
+        # does.  Monsters and items are scattered single letters, a shop full
+        # of stock is rows of '[' and '$' - and 40 of those used to make the
+        # window "not a map", which stopped shop interiors merging at all and
+        # let the memory behind them go stale exactly when it mattered.
+        if len(re.findall(r"[A-Za-z]{3,}", body)) >= 4:
             return None  # a menu or prompt drawn over the map area
         return (first, last)
 
@@ -454,10 +568,14 @@ class NetHackClient:
         window = self._map_window(screen_lines)
         if window is None:
             return {"updated": False, "reason": "no map window on screen"}
-        player = self._find_player(screen_lines)
-        assert player is not None
+        candidates = self._player_candidates(screen_lines, window)
+        assert candidates, "_map_window already required an @"
         info = self.get_map().apply_screen(
-            screen_lines, player, window, expected_world=expected_world
+            screen_lines,
+            candidates[0],
+            window,
+            expected_world=expected_world,
+            player_candidates=candidates,
         )
         info["updated"] = True
         return info
@@ -507,7 +625,9 @@ class NetHackClient:
             or dungeon_map.has_door_leaf(before_pos)
         ):
             reason = "NetHack refuses diagonals into or out of an intact doorway"
-        elif shown not in VISIBLE_TERRAIN and shown != "@":
+        elif shown not in VISIBLE_TERRAIN:
+            # any other visible thing - a monster, a shopkeeper drawn '@', an
+            # item, a boulder - stands in the way without being terrain
             reason = f"something is standing there ({shown})"
         elif tile is not None and tile.terrain == CAVE:
             # drawn '#' and it stopped us: not a corridor after all
@@ -618,17 +738,49 @@ class NetHackClient:
         cleared = self._drain_more(before_lines)
         if cleared:
             _, before_lines = self._capture_screen()
+        pre_cleared = list(self.cleared_messages)
+        pre_pager_diff = self.pager_diff
 
         paused = bool(self._open_prompt(before_lines))
+
+        # A pure route (direction keys and o+dir pairs) is walked one key at a
+        # time with the screen checked between each, instead of being typed
+        # into the void and hoped for.
+        tokens = None if paused else route_tokens(command)
+        if tokens is not None and len(tokens) > 1 and before_pos is not None:
+            routed = self._run_route(
+                command, tokens, pre_cleared, pre_pager_diff
+            )
+            if routed is not None:
+                return routed
+            # position could not be verified before starting: fall through and
+            # send the command whole, letting the screen re-anchor us
+
         expected_world = None
         if not paused and before_pos is not None:
-            # a frontier route arrives as several keys: add the steps up so the
-            # screen match has somewhere sensible to start looking.  It is only
-            # a starting point - a blocked move makes it wrong, and the screen
-            # decides either way.
+            # not a verifiable route, but the keys may still walk: add the
+            # steps up so the screen match has somewhere sensible to start
+            # looking.  It is only a starting point - a blocked move makes it
+            # wrong, and the screen decides either way.
             steps = route_displacement(command)
             if steps is not None and steps != (0, 0):
                 expected_world = (before_pos[0] + steps[0], before_pos[1] + steps[1])
+                if steps in KEY_DIRS.values():
+                    # one step that would land on an @ the screen already
+                    # drew is a bump, not an arrival: NetHack refuses the tile
+                    # and certainly does not swap you with the shopkeeper
+                    # standing in it.  Withholding the expected position lets
+                    # the merge anchor on the @ that was ours last frame,
+                    # which is the difference between "blocked, try around"
+                    # and living the rest of the run one tile sideways.
+                    b_off = before_map.dungeon_offset
+                    wr = before_pos[0] - b_off[0] + steps[0]
+                    wc = before_pos[1] - b_off[1] + steps[1]
+                    if (
+                        0 <= wr < len(before_lines)
+                        and before_lines[wr][wc : wc + 1] == "@"
+                    ):
+                        expected_world = None
 
         try:
             for kind, payload in keys_for(command):
@@ -639,35 +791,245 @@ class NetHackClient:
         except subprocess.CalledProcessError as exc:
             return {"status": "error", "error": f"Failed to send command: {exc}"}
 
+        prompt = self._open_prompt(before_lines)
+        if not paused:
+            self._mark_search(command)
         try:
             self._wait_until_stable(timeout=3.0)
+            # A message this command produced can already be sitting on the
+            # pager; drain it now, before the reply is built, instead of
+            # leaving it to eat the next command's keys.
+            _, after_lines = self._capture_screen()
+            post_cleared = self._drain_more(after_lines)
+            # merge *before* judging the move: "did it go nowhere" is a
+            # question about where the map says the hero is *after* the
+            # screen spoke, and answering it from the pre-merge position
+            # reports every successful step as a block - and a false block
+            # on drawn '#' would even mark the hero's new tile solid
             state = self.get_state(expected_world=expected_world)
         except RuntimeError as exc:
             return {"status": "error", "error": str(exc)}
 
-        prompt = self._open_prompt(before_lines)
-        after_map = self.maps.get(self.current_level)
-        after_pos = after_map.player_world_pos if after_map else None
         notes = []
-        if self.cleared_messages:
+        cleared_all = list(dict.fromkeys(pre_cleared + post_cleared))
+        if cleared_all:
             notes.append(
                 "cleared {} waiting message(s): {}".format(
-                    len(self.cleared_messages),
-                    "; ".join(dict.fromkeys(self.cleared_messages)),
+                    len(cleared_all), "; ".join(cleared_all)
                 )
             )
+        pager_diffs = [d for d in (pre_pager_diff, self.pager_diff if post_cleared else "") if d]
         if prompt:
             notes.append(
                 f"the game is asking {prompt!r} - your key answered that, it did not move you"
             )
         else:
+            after_map = self.maps.get(self.current_level)
+            after_pos = after_map.player_world_pos if after_map else None
             note = self._note_move_result(command, before_pos, before_lines, after_pos)
             if note:
                 notes.append(note)
         if notes:
             state["move_result"] = "\n".join(notes)
-        if self.pager_diff:
-            state["pager_diff"] = self.pager_diff
+        if pager_diffs:
+            state["pager_diff"] = "\n".join(pager_diffs)
+        self._persist_state(state)
+        return state
+
+    def _run_route(
+        self,
+        command: str,
+        tokens: list[str],
+        pre_cleared: list[str],
+        pre_pager_diff: str,
+    ) -> dict[str, Any] | None:
+        """Walk a frontier route one key at a time, verifying each step.
+
+        Sending a route as one string is what turned two runs into coordinate
+        archaeology: a message that fires mid-route pages on ``--More--``, and
+        this build's pager destroys every letter typed at it (``more()`` waits
+        on ``xwaitforspace`` in ``win/tty/topl.c`` - Space turns the page, all
+        else is eaten).  So keys go out singly and each is checked against the
+        screen before the next follows: the first key the game does not execute
+        stops the route, the remaining keys are never typed, and the reply
+        names how far the route actually got and why it stopped.
+
+        Returns ``None`` when the map's hero position is not the ``@`` on
+        screen - the disagreement itself is decided by the normal path.
+        """
+        dungeon_map = self.get_map()
+        offset = dungeon_map.dungeon_offset
+        hero_screen = (
+            dungeon_map.player_world_pos[0] - offset[0],
+            dungeon_map.player_world_pos[1] - offset[1],
+        )
+        _, lines = self._capture_screen()
+        window = self._map_window(lines)
+        if window is None:
+            return None
+        if not (
+            0 <= hero_screen[0] < len(lines)
+            and lines[hero_screen[0]][hero_screen[1] : hero_screen[1] + 1] == "@"
+        ):
+            return None  # memory and screen disagree before we even started
+        prev_candidates = self._player_candidates(lines, window)
+
+        notes: list[str] = []
+        pager_diffs: list[str] = [d for d in (pre_pager_diff,) if d]
+        cleared: list[str] = list(pre_cleared)
+        consumed = 0
+        pending = (0, 0)  # fast-pathed steps not yet merged into the map
+        merged_world = dungeon_map.player_world_pos
+        stop_reason = ""
+        blocked_note = ""
+
+        for index, token in enumerate(tokens, start=1):
+            _, lines = self._capture_screen()
+            if "--More--" in "\n".join(lines):
+                cleared += self._drain_more(lines)
+                if self.pager_diff:
+                    pager_diffs.append(self.pager_diff)
+                _, lines = self._capture_screen()
+            question = self._open_prompt(lines)
+            if question:
+                stop_reason = (
+                    f"stopped before key {index} ({token!r}): the game is "
+                    f"asking {question!r}"
+                )
+                break
+            world_before = (
+                merged_world
+                if pending == (0, 0)
+                else (merged_world[0] + pending[0], merged_world[1] + pending[1])
+            )
+            try:
+                self._type(token)
+            except subprocess.CalledProcessError as exc:
+                return {"status": "error", "error": f"Failed to send command: {exc}"}
+            consumed += 1
+            if len(token) > 1:  # 'o'+direction opens a door, moves nobody
+                continue
+
+            step = KEY_DIRS[token]
+            want = (hero_screen[0] + step[0], hero_screen[1] + step[1])
+            self._wait_until_stable(timeout=1.5, settle=0.12)
+            _, lines = self._capture_screen()
+            if self._extract_level(lines) not in (None, self.current_level):
+                stop_reason = f"stopped after {index} key(s): the level changed"
+                break
+            window = self._map_window(lines)
+            if window is None:
+                asked = self._open_prompt(lines)
+                stop_reason = f"stopped after {index} key(s): " + (
+                    f"the game is asking {asked!r}" if asked else "the screen is not the map any more"
+                )
+                break
+            candidates = self._player_candidates(lines, window)
+            if candidates == [want]:
+                # exactly one @ and it is where the key said: odometry holds,
+                # the merge can wait for the end of the route
+                hero_screen = want
+                prev_candidates = candidates
+                pending = (pending[0] + step[0], pending[1] + step[1])
+                continue
+            if want in prev_candidates and hero_screen in candidates:
+                # that @ sat on `want` before this key, too - and NetHack
+                # refuses to walk into a tile an @ already holds.  So the
+                # hero did not move, the other @ was in the way; merging
+                # without a key-implied position lets continuity keep us
+                # where we were, and the block gets named below.
+                info = self.update_map(lines, expected_world=None)
+                pending = (0, 0)
+                prev_candidates = candidates
+                if info.get("updated") and info.get("player_world_pos"):
+                    merged_world = info["player_world_pos"]
+                    offset = self.get_map().dungeon_offset
+                    hero_screen = (
+                        merged_world[0] - offset[0],
+                        merged_world[1] - offset[1],
+                    )
+                blocked_note = (
+                    self._note_move_result(token, world_before, lines, merged_world) or ""
+                )
+                stop_reason = f"key {index} ({token!r}) did not move you"
+                break
+            # anything else - the viewport scrolled, the hero stayed, another
+            # @ appeared beside the tile we wanted - is decided by the merge,
+            # with the keys naming where it should start looking
+            expected = (world_before[0] + step[0], world_before[1] + step[1])
+            info = self.update_map(lines, expected_world=expected)
+            pending = (0, 0)
+            prev_candidates = candidates
+            new_world = info.get("player_world_pos") if info.get("updated") else None
+            if new_world is None:
+                stop_reason = f"stopped after {index} key(s): the screen gave the map nothing to hold"
+                break
+            moved = new_world != world_before
+            merged_world = new_world
+            offset = self.get_map().dungeon_offset
+            hero_screen = (new_world[0] - offset[0], new_world[1] - offset[1])
+            if info.get("alignment_status") == "ambiguous":
+                stop_reason = (
+                    f"stopped after {index} key(s): two @ on this screen and it "
+                    f"cannot say which is you - the map is unchanged"
+                )
+                break
+            if not moved:
+                blocked_note = self._note_move_result(token, world_before, lines, new_world) or ""
+                stop_reason = f"key {index} ({token!r}) did not move you"
+                break
+
+        try:
+            _, lines = self._capture_screen()
+            if "--More--" in "\n".join(lines):
+                cleared += self._drain_more(lines)
+                if self.pager_diff:
+                    pager_diffs.append(self.pager_diff)
+        except RuntimeError:
+            pass  # the game may have ended mid-route; get_state will report it
+
+        if cleared:
+            notes.append(
+                "cleared {} waiting message(s): {}".format(
+                    len(cleared), "; ".join(dict.fromkeys(cleared))
+                )
+            )
+        if stop_reason:
+            notes.append(
+                f"route consumed {consumed} of {len(tokens)} keys ({sum(len(t) for t in tokens[:consumed])} of {len(command)} characters): {stop_reason}"
+            )
+            if blocked_note:
+                notes.append(blocked_note)
+
+        expected_world = None
+        if pending != (0, 0):
+            expected_world = (merged_world[0] + pending[0], merged_world[1] + pending[1])
+        return self._finish_state(expected_world, notes, pager_diffs)
+
+    def _mark_search(self, command: str) -> None:
+        """A completed ``s`` (or ``2s``, ``20s``) searched the walls around
+        where the hero stands; the ledger is what later turns "no exit here"
+        into a checklist with a bounded end."""
+        if not re.fullmatch(r"\d*s", command):
+            return
+        dungeon_map = self.maps.get(self.current_level)
+        if dungeon_map is not None and dungeon_map.player_world_pos is not None:
+            dungeon_map.mark_searched_around(dungeon_map.player_world_pos)
+
+    def _finish_state(
+        self,
+        expected_world: tuple[int, int] | None,
+        notes: list[str],
+        pager_diffs: list[str],
+    ) -> dict[str, Any]:
+        try:
+            state = self.get_state(expected_world=expected_world)
+        except RuntimeError as exc:
+            return {"status": "error", "error": str(exc)}
+        if notes:
+            state["move_result"] = "\n".join(notes)
+        if pager_diffs:
+            state["pager_diff"] = "\n".join(pager_diffs)
         self._persist_state(state)
         return state
 
@@ -710,17 +1072,23 @@ class NetHackClient:
             (max((len(l) for l in current), default=0)),
             (max((len(l) for l in previous), default=0)),
         )
-        lines = []
-        for row in range(max_lines):
+
+        def cell(row: int, col: int) -> str:
             cur = current[row] if row < len(current) else ""
             old = previous[row] if row < len(previous) else ""
-            changed = "".join(
-                (cur[col] if col < len(cur) else " ")
-                if (cur[col] if col < len(cur) else " ")
-                != (old[col] if col < len(old) else " ")
-                else " "
-                for col in range(max_width)
-            ).rstrip()
+            c = cur[col] if col < len(cur) else " "
+            o = old[col] if col < len(old) else " "
+            if c == o:
+                return " "
+            # a cell that changed shows what is there now - and when the new
+            # screen blanked something, what used to be there: a drained pager
+            # line *disappears*, and a diff that only ever showed additions
+            # would report the page turn as nothing at all
+            return c if c != " " else o
+
+        lines = []
+        for row in range(max_lines):
+            changed = "".join(cell(row, col) for col in range(max_width)).rstrip()
             if changed:
                 lines.append(f"{row:2d}|{changed}")
         return "\n".join(lines)
@@ -749,12 +1117,32 @@ class NetHackClient:
         return f"world ({row},{col}) on {where}{suffix}"
 
     def _neighbour_hints(self, screen_lines: list[str]) -> str:
-        """What the eight tiles around the player are, live and remembered."""
-        player = self._find_player(screen_lines)
+        """What the eight tiles around the player are, live and remembered.
+
+        The hero's screen cell comes from the *committed* map position, not
+        from rescanning for an ``@`` - with a shopkeeper in view the rescan and
+        the memory can name different @s, and then the eight neighbours would
+        be listed around the wrong one.
+        """
         dungeon_map = self.maps.get(self.current_level)
-        if player is None or dungeon_map is None:
+        if dungeon_map is None or dungeon_map.player_world_pos is None:
             return ""
-        prow, pcol = player
+        offset = dungeon_map.dungeon_offset
+        prow, pcol = (
+            dungeon_map.player_world_pos[0] - offset[0],
+            dungeon_map.player_world_pos[1] - offset[1],
+        )
+        if not (
+            0 <= prow < len(screen_lines)
+            and screen_lines[prow][pcol : pcol + 1] == "@"
+        ):
+            window = self._map_window(screen_lines)
+            if window is None:
+                return ""
+            candidates = self._player_candidates(screen_lines, window)
+            if not candidates:
+                return ""
+            prow, pcol = candidates[0]
         lines = []
         for step, key in DIR_KEYS.items():
             r, c = prow + step[0], pcol + step[1]
@@ -786,7 +1174,15 @@ class NetHackClient:
                 walkable = "water/lava: you would swim"
             if diagonal and tile is not None and tile.doorway:
                 walkable += " and no diagonal entry"
-            live = "" if on_screen == key else f" screen shows '{on_screen}'"
+            # say something only where the screen and memory are worth
+            # comparing: occupants (monsters, items) always, and any drawn
+            # glyph that disagrees with what is remembered here
+            live = ""
+            if on_screen != " " and (
+                on_screen not in VISIBLE_TERRAIN
+                or (tile is not None and tile_matches(on_screen, tile) < 0)
+            ):
+                live = f" screen shows '{on_screen}'"
             lines.append(f"`{key}` {known:<12} {walkable}{live}")
         return "\n".join(lines)
 
@@ -856,7 +1252,15 @@ class NetHackClient:
         # renders "(no memory yet)"; a screen that is not the map (menu,
         # prompt) still gets back the memory as it stands.
         dungeon_map = self.get_map()
-        if info.get("conflicts"):
+        if info.get("alignment_status") == "ambiguous":
+            candidates = info.get("hero_candidates") or []
+            state_warning = (
+                "AMBIGUOUS position: the @ on screen could be you at "
+                + " or ".join(f"({c[0]},{c[1]})" for c in candidates)
+                + "; memory was NOT rewritten. Take one single-key step, or run "
+                "`#lookaround` from where you stand - the @ that moves is you"
+            )
+        elif info.get("conflicts"):
             state_warning = (
                 f"{info['conflicts']} of the {info['coverage']} remembered tile(s) this "
                 f"screen covers disagree with it (alignment {info.get('alignment')}): the "
@@ -882,9 +1286,30 @@ class NetHackClient:
         }
         if state_warning:
             state["map_warning"] = state_warning
+        state["alignment"] = {
+            "status": info.get("alignment_status", "locked"),
+            "alternatives": info.get("alternatives", []),
+        }
         summary = dungeon_map.describe()
         state["player_world_pos"] = summary["player_world_pos"]
         state["map_summary"] = summary
+        if (
+            info.get("updated")
+            and summary.get("frontier_cells", 0) == 0
+            and not summary.get("downstairs")
+            and summary.get("remembered_tiles", 0) >= 30
+        ):
+            # "nothing left to explore" and "no way out found" together are not
+            # a finished level - they are the level that eats runs.  Say so,
+            # with the checklist that ends it.
+            state["exit_warning"] = (
+                "NO EXIT remembered on this level: frontier empty and no '>' "
+                "ever drawn. {} wall tile(s) touching reachable ground have "
+                "never been searched - stand next to each and `2s`, cross-check "
+                "with `#terrain` or `#lookaround` for stairs the map missed, and "
+                "if it stays dry go back up (`<`) and hunt a shaft instead of "
+                "orbiting these walls.".format(summary.get("unsearched_walls", 0))
+            )
         hints = []
         if self.current_goal:
             hints.append(f"Goal: {self.current_goal}")
@@ -896,15 +1321,10 @@ class NetHackClient:
         state["map"] = dungeon_map.render()
         state["frontier"] = self._frontier_report(summary)
 
-        if "--More--" in raw_text:
-            state["prompt"] = (
-                "messages are waiting behind --More--; a 'nethack_move' clears them "
-                "automatically before your command runs"
-            )
-        else:
-            open_prompt = self._open_prompt(screen_lines)
-            if open_prompt:
-                state["prompt"] = f"the game is waiting for an answer: {open_prompt}"
+        awaiting = self._awaiting(screen_lines)
+        if awaiting:
+            state["awaiting"] = awaiting
+            state["prompt"] = awaiting["note"]
 
         self.game_state = state
         return state
@@ -961,11 +1381,16 @@ class NetHackClient:
     def _restore_state(self) -> None:
         import glob
 
-        files = sorted(glob.glob(f"{self.STATE_FILE_PREFIX}*.json"))
+        files = glob.glob(f"{self.STATE_FILE_PREFIX}*.json")
         if not files:
             return
+        # the *most recently written* state: several files sit around whenever
+        # games were started without nethack_stop, and the alphabetically
+        # oldest one is a different, probably dead, game
+        files.sort(key=os.path.getmtime)
+        newest = files[-1]
         try:
-            with open(files[0]) as handle:
+            with open(newest) as handle:
                 state = json.load(handle)
         except Exception as exc:
             _log_error("_restore_state: reading", exc)
@@ -975,7 +1400,7 @@ class NetHackClient:
         if not session:
             return
         self.session_name = session
-        self.state_file = files[0]
+        self.state_file = newest
         self.current_goal = state.get("current_goal", "")
         self.current_level = int(state.get("current_level", 1))
         self.previous_screen = state.get("previous_screen")
@@ -1026,6 +1451,8 @@ def _format_state(state: dict[str, Any]) -> str:
         parts += ["", "=== MOVE ===", state["move_result"]]
     if state.get("map_warning"):
         parts += ["", f"WARNING: {state['map_warning']}"]
+    if state.get("exit_warning"):
+        parts += ["", f"WARNING: {state['exit_warning']}"]
     if state.get("hints"):
         parts += ["", state["hints"]]
     header = f"=== MAP (level {state.get('level')}) ==="
@@ -1037,6 +1464,11 @@ def _format_state(state: dict[str, Any]) -> str:
         parts += ["", "=== FRONTIER (?) ===", state["frontier"]]
     summary = state.get("map_summary") or {}
     if summary:
+        stairs_down = summary.get("downstairs") or []
+        if stairs_down:
+            stair_text = ", ".join(f"({p[0]},{p[1]})" for p in stairs_down)
+        else:
+            stair_text = "NEVER SEEN"
         parts += [
             "",
             "remembered {r} tiles, visited {v}, {f} unrevealed reachable cells; "
@@ -1044,10 +1476,17 @@ def _format_state(state: dict[str, Any]) -> str:
                 r=summary.get("remembered_tiles", 0),
                 v=summary.get("visited_tiles", 0),
                 f=summary.get("frontier_cells", 0),
-                d=tuple(summary["downstairs"]) if summary.get("downstairs") else "not seen",
+                d=stair_text,
             ),
         ]
-    if state.get("prompt"):
+    awaiting = state.get("awaiting")
+    if awaiting:
+        block = [f"=== AWAITING ({awaiting['kind']}) ==="]
+        if awaiting.get("question"):
+            block.append(awaiting["question"])
+        block.append("safe to send: " + awaiting["reply"])
+        parts += ["", "\n".join(block)]
+    elif state.get("prompt"):
         parts += ["", f"NOTE: {state['prompt']}"]
     if state.get("diff"):
         parts += ["", "=== DIFF ===", state["diff"]]

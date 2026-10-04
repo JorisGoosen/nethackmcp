@@ -30,6 +30,11 @@ The map is a record of *memory*, not of the real level.
   something has confirmed it.
 * NetHack refuses **diagonal** moves into or out of an intact doorway, so routes
   never plan one.
+* A tile that only ever showed an occupant is remembered as *guessed* ground.
+  A guess that stands next to the player and still draws blank retires: the
+  thing seen there was a transient effect (a beam, an explosion) and the tile
+  is rockwall after all.  ``I`` - where an unseen monster was last *heard* -
+  is never evidence of ground at all.
 
 Rendered map glyphs
 -------------------
@@ -121,13 +126,16 @@ def tile_matches(drawn: str, tile: Tile) -> int:
         # a blank is agreement and any glyph at all means we are not here
         return 1 if drawn == " " else -1
     if drawn == " ":
-        # everything remembered was drawn once, and the game does not forget.
-        # A *guessed* tile is the exception worth knowing about: it was never
-        # drawn as terrain, only seen under a monster or an item, and a glyph
-        # there can also have been a transient effect (a zap or an explosion is
-        # drawn over rockwall too).  Such a blank should retire the guess rather
-        # than count against the alignment - until it does, a wrong guess is
-        # reported as a conflict.
+        # everything remembered was drawn once, and the game does not forget,
+        # so a blank over remembered terrain contradicts the alignment.  The
+        # exception is a *guessed* tile: it was never drawn as terrain, only
+        # seen under something standing there - and transient effects (a zap's
+        # beam, an explosion) are drawn over rockwall too, so the guess may
+        # have been wrong.  A blank over a guess says nothing about where the
+        # screen sits; ``mark_solid`` retires the guess when adjacency proves
+        # the tile is rockwall.
+        if tile.guessed and not tile.visited:
+            return 0
         return -1 if tile.memory else 0
     if drawn not in VISIBLE_TERRAIN:
         # the player, a monster, an item: all of them stand on ground.  A wall
@@ -203,6 +211,32 @@ def route_displacement(command: str) -> tuple[int, int] | None:
             return None
         total = (total[0] + step[0], total[1] + step[1])
     return total
+
+
+def route_tokens(command: str) -> list[str] | None:
+    """Split a frontier route into the atomic keystrokes it is made of.
+
+    A route is direction keys, optionally with ``o``+direction in front of a
+    step that enters a shut door.  Nothing else parses: a run key travels an
+    unknown distance, a count repeats, a wait or a command letter has effects
+    this split could not verify key by key, and anything with such a key in it
+    goes to the game whole, exactly as before.
+    """
+    if not command:
+        return None
+    tokens: list[str] = []
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == "o" and i + 1 < len(command) and command[i + 1] in KEY_DIRS:
+            tokens.append(command[i : i + 2])
+            i += 2
+        elif char in KEY_DIRS:
+            tokens.append(char)
+            i += 1
+        else:
+            return None
+    return tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -330,11 +364,27 @@ class DungeonMap:
         #: world coordinate = dungeon_offset + screen coordinate
         self.dungeon_offset: tuple[int, int] = (0, 0)
         self.player_world_pos: tuple[int, int] | None = None
-        self.downstairs_pos: tuple[int, int] | None = None
-        self.upstairs_pos: tuple[int, int] | None = None
+        #: every staircase this level has shown us.  A level can hold two of
+        #: either (a broken corridor, a shaft), and a single slot lets the
+        #: second stair silently overwrite the first - which is how "no way
+        #: down" gets invented on a level that has one.
+        self.downstairs: set[tuple[int, int]] = set()
+        self.upstairs: set[tuple[int, int]] = set()
+        #: wall/rockwall tiles we have stood next to and pressed `s`; the
+        #: ledger that makes "this level is searched" a fact instead of a vibe
+        self.searched: set[tuple[int, int]] = set()
         self._rooms_cache: list[Room] | None = None
         self._reach_cache: dict[tuple[int, int], int] | None = None
         self._frontier_cache: set[tuple[int, int]] | None = None
+
+    @property
+    def downstairs_pos(self) -> tuple[int, int] | None:
+        """The first remembered down stair, for callers that only want one."""
+        return min(self.downstairs, default=None)
+
+    @property
+    def upstairs_pos(self) -> tuple[int, int] | None:
+        return min(self.upstairs, default=None)
 
     def _invalidate(self) -> None:
         self._rooms_cache = None
@@ -387,9 +437,9 @@ class DungeonMap:
         if changed:
             self._invalidate()
         if terrain == DOWN:
-            self.downstairs_pos = (row, col)
+            self.downstairs.add((row, col))
         elif terrain == UP:
-            self.upstairs_pos = (row, col)
+            self.upstairs.add((row, col))
         return True
 
     def observe_guess(self, row: int, col: int) -> None:
@@ -447,13 +497,21 @@ class DungeonMap:
         to bar the way is iron bars, a tree or a raised drawbridge - the tty map
         draws all of those as ``#`` - but only if we have never stood in it.
         A doorway keeps its state: a shut door is a way through, not a wall.
+
+        A *guess* next to the player that drew blank was simply wrong: the tile
+        showed an occupant (or a transient effect) at a moment we could not see
+        the ground, and now that we overlook it, nothing is drawn there.  The
+        guess retires and the rockwall takes its place.
         """
         tile = self._touch(row, col)
         if tile.doorway or tile.solid:
             return
         if tile.visited:
             return  # we have walked here, so whatever stopped us was not terrain
-        if tile.memory and tile.terrain != CAVE:
+        if tile.guessed:
+            tile.terrain = None
+            tile.guessed = False
+        elif tile.memory and tile.terrain != CAVE:
             return  # a wall or floor we saw drawn is not a surprise obstacle
         tile.solid = True
         self._invalidate()
@@ -461,6 +519,49 @@ class DungeonMap:
         # door was waiting for: its wall neighbours are never drawn until
         # something stands where the room used to be unseen
         self.infer_doorways()
+
+    # ------------------------------------------------------------------ #
+    #  the search ledger
+    # ------------------------------------------------------------------ #
+
+    def mark_searched_around(self, pos: tuple[int, int]) -> int:
+        """Record that the player stood at ``pos`` and searched (``s``).
+
+        Searching covers the eight tiles around the searcher; re-searching a
+        tile is legal (a secret door may be found on the tenth attempt when
+        the ninth failed), but the ledger is what lets the server say "every
+        wall within reach has been searched twice" instead of leaving that to
+        the player's memory of how many ``20s`` they typed.
+
+        Returns how many wall tiles were newly covered.
+        """
+        row, col = pos
+        covered = 0
+        for dr, dc in DIR_KEYS:
+            wall = (row + dr, col + dc)
+            tile = self.tiles.get(wall)
+            if tile is None or wall in self.searched:
+                continue
+            if tile.solid or tile.terrain in (WALL_V, WALL_H):
+                self.searched.add(wall)
+                covered += 1
+        return covered
+
+    def unsearched_wall_targets(self) -> list[tuple[int, int]]:
+        """Wall or rockwall tiles that touch reachable ground and no search
+        has covered yet - the checklist of where a secret door could still be.
+        """
+        found: set[tuple[int, int]] = set()
+        for pos in self.reachable():
+            row, col = pos
+            for dr, dc in DIR_KEYS:
+                wall = (row + dr, col + dc)
+                if wall in self.searched:
+                    continue
+                tile = self.tiles.get(wall)
+                if tile is not None and (tile.solid or tile.terrain in (WALL_V, WALL_H)):
+                    found.add(wall)
+        return sorted(found)
 
     # ------------------------------------------------------------------ #
     #  open doors, read from the wall around them
@@ -577,12 +678,17 @@ class DungeonMap:
         A monster, item or feature is only ever drawn on walkable ground, so a
         visible glyph there settles the question: the tile is not a wall.  The
         exact ground type stays unknown, so we remember plain floor.
+
+        ``I`` is the notable exception (``MONSYM`` ``S_invisible``): it marks
+        where an unseen monster was *last heard*, and that spot needs no ground
+        at all - sound reaches through rockwall.  Remembering it as floor is
+        how phantom rooms appear out of nowhere, so it proves nothing.
         """
         first, last = map_rows
         cells: list[tuple[int, int]] = []
         for srow in range(max(first, 0), min(last, len(screen_lines) - 1) + 1):
             for scol, char in enumerate(screen_lines[srow]):
-                if char == " " or char == "@" or char in VISIBLE_TERRAIN:
+                if char == " " or char == "@" or char == "I" or char in VISIBLE_TERRAIN:
                     continue
                 cells.append((srow, scol))
         return cells
@@ -693,14 +799,25 @@ class DungeonMap:
     ) -> dict[str, Any]:
         """Find where this screen sits in the level.
 
-        The search starts at the alignment the screen had when it was last read
-        - the viewport only moves when you walk to its edge - and works outward
-        one tile at a time, so the first alignment that contradicts nothing is
-        also the nearest one and there is no reason to look further.  When the
-        keys say where the player should have ended up, that implied alignment
-        is tried first and the old one right after it.
+        The search starts at the alignment the keys imply and the one the
+        screen had when it was last read, and works outward one tile at a
+        time.  Two rules keep the answer from wavering, and both were learned
+        the hard way inside one symmetric shop room:
 
-        Returns ``{"offset", "matches", "conflicts", "coverage"}``.
+        * **A tie keeps the alignment we already had.**  A screen that
+          contradicts nothing at two offsets - a room whose walls look the
+          same shifted a tile - must not move the map to whichever offset the
+          ring order happened to reach first, or every re-read of such a room
+          flips the level between two readings.  A new alignment has to
+          explain *strictly more* memory to win.
+        * **An equally clean second reading is reported, not hidden.**  Once a
+          conflict-free fit is found the search continues two rings further;
+          any other clean fit that explains as much memory comes back in
+          ``alternatives``, so the caller knows the screen places us in more
+          than one place and can say so instead of steering by a coin flip.
+
+        Returns ``{"offset", "matches", "conflicts", "coverage", "candidates",
+        "alternatives"}``.
         """
         index = self.remembered_by_row()
         width = window_width(screen_lines, map_rows)
@@ -725,6 +842,7 @@ class DungeonMap:
                 "conflicts": 0,
                 "coverage": 0,
                 "candidates": 0,
+                "alternatives": [],
             }
 
         # An alignment only earns trust by being tested, so it has to cover a
@@ -733,11 +851,15 @@ class DungeonMap:
         # nothing simply because it looks at nothing.
         need = max(MIN_ALIGN_COVERAGE, max(self.coverage(index, s, rows, width) for s in starts) // 2)
 
-        best: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int]] | None = None
+        best: tuple[tuple[int, int, int, int], tuple[int, int, int], tuple[int, int]] | None = None
+        clean_fits: list[tuple[int, int, tuple[int, int]]] = []
         tried: set[tuple[int, int]] = set()
         scored = 0
+        stop_after: int | None = None  # rings past the first clean fit still worth a look
         for start in starts:
             for radius in range(search_radius + 1):
+                if stop_after is not None and radius > stop_after:
+                    break
                 for candidate in _ring(start, radius):
                     if candidate in tried:
                         continue
@@ -754,23 +876,20 @@ class DungeonMap:
                     )
                     if coverage < need:
                         continue  # untested: this offset is not evidence of anything
+                    if conflicts == 0:
+                        clean_fits.append((matches, coverage, candidate))
+                        if stop_after is None or radius < stop_after:
+                            stop_after = radius + 2
                     key = (
                         conflicts,
                         -matches,
+                        # stickiness: equal conflicts and matches keep the
+                        # alignment we were already reading the world through
+                        0 if candidate == self.dungeon_offset else 1,
                         abs(candidate[0] - starts[0][0]) + abs(candidate[1] - starts[0][1]),
                     )
                     if best is None or key < best[0]:
                         best = (key, (matches, conflicts, coverage), candidate)
-                        if conflicts == 0:
-                            # nothing contradicts this alignment and it is the
-                            # nearest one that does not: stop looking
-                            return {
-                                "offset": candidate,
-                                "matches": matches,
-                                "conflicts": 0,
-                                "coverage": coverage,
-                                "candidates": scored,
-                            }
         if best is None:
             # nothing in range covers enough memory to judge: keep the alignment
             # the keyboard implies, the map is entering country we have not seen
@@ -783,14 +902,21 @@ class DungeonMap:
                 "conflicts": conflicts,
                 "coverage": coverage,
                 "candidates": scored,
+                "alternatives": [],
             }
         _, (matches, conflicts, coverage), candidate = best
+        alternatives = [
+            {"offset": list(alt), "matches": alt_matches, "coverage": alt_cov}
+            for alt_matches, alt_cov, alt in clean_fits
+            if alt != candidate and conflicts == 0 and alt_matches >= matches
+        ]
         return {
             "offset": candidate,
             "matches": matches,
             "conflicts": conflicts,
             "coverage": coverage,
             "candidates": scored,
+            "alternatives": alternatives,
         }
 
     def apply_screen(
@@ -799,6 +925,7 @@ class DungeonMap:
         player_screen: tuple[int, int],
         map_rows: tuple[int, int],
         expected_world: tuple[int, int] | None = None,
+        player_candidates: list[tuple[int, int]] | None = None,
     ) -> dict[str, Any]:
         """Merge one screen into memory.
 
@@ -808,27 +935,120 @@ class DungeonMap:
         because odometry is wrong the moment a move is refused, a monster
         blocks the way or the hero is levitating over water.
 
-        Returns the offset, how much of memory it explains and how many tiles it
-        contradicts; a nonzero conflict count means the map may be misaligned.
-        """
-        cells = self.screen_cells(screen_lines, map_rows)
+        ``player_candidates`` is every ``@`` the screen draws inside the map
+        window.  One of them is the hero; a shopkeeper, a human-shaped statue
+        or a shield spell effect can draw another, and picking the wrong one
+        puts the whole level one tile sideways.  With two or more, each is
+        tried as the hero in turn and the reading that contradicts memory
+        least wins; where that still scores exactly equal, the screen cannot
+        say who is who - so the merge says ``alignment_status: "ambiguous"``,
+        touches nothing, and leaves the caller to move one tile and let the
+        delta answer.  Which ``@`` is the hero is decided by continuity: the
+        one memory and the keys agree is *moving*, not the first one found.
 
-        scrolled = False
+        Returns the offset, how much of memory it explains and how many tiles
+        it contradicts; a nonzero conflict count means the map may be
+        misaligned.
+        """
+        candidates = list(dict.fromkeys(player_candidates or [player_screen]))
+        if player_screen not in candidates:
+            candidates.insert(0, player_screen)
+        predicted = expected_world if expected_world is not None else self.player_world_pos
+
+        def chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
+            return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+        alternatives: list[dict[str, Any]] = []
         if not self.tiles:
-            self.dungeon_offset = (-player_screen[0], -player_screen[1])
+            # a level never seen anchors on the hero - with several @ glyphs on
+            # the very first screen the hero is the one the viewport centres on,
+            # the only evidence available before there is any memory
+            first, last = window_rows(screen_lines, map_rows)
+            mid_r, mid_c = (first + last) / 2, window_width(screen_lines, map_rows) / 2
+            hero = min(candidates, key=lambda p: (abs(p[0] - mid_r), abs(p[1] - mid_c)))
+            self.dungeon_offset = (-hero[0], -hero[1])
             scrolled = True
-            matches, conflicts, coverage = 0, 0, 0
-            tried = 0
+            matches, conflicts, coverage, tried = 0, 0, 0, 0
         else:
-            solved = self.solve_offset(
-                screen_lines, map_rows, player_screen, expected_world
+            readings = []
+            for cand in candidates:
+                solved = self.solve_offset(
+                    screen_lines, map_rows, cand, expected_world
+                )
+                world = (solved["offset"][0] + cand[0], solved["offset"][1] + cand[1])
+                continuity = chebyshev(world, predicted) if predicted is not None else 0
+                readings.append((solved, cand, world, continuity))
+            readings.sort(
+                key=lambda r: (
+                    r[0]["conflicts"],
+                    -r[0]["matches"],
+                    # stickiness comes before continuity: when two readings of
+                    # this screen explain memory equally, the one that keeps
+                    # the alignment we already read the world through wins -
+                    # that is what stops a symmetric shop from flipping the
+                    # level between two clean fits on every re-read.  (A real
+                    # scroll puts the old offset's terrain out of register, so
+                    # the old reading loses on conflicts and cannot hide.)
+                    0 if r[0]["offset"] == self.dungeon_offset else 1,
+                    # only between equally-standing alignments do the keys
+                    # pick which @ is the hero
+                    r[3],
+                    r[0]["candidates"],
+                )
             )
+            solved, hero, hero_world, continuity = readings[0]
             matches, conflicts, coverage = (
                 solved["matches"],
                 solved["conflicts"],
                 solved["coverage"],
             )
             tried = solved["candidates"]
+
+            # A screen that fits twice may still be worth believing: when the
+            # fit we keep is the one we already had, nothing flips and the
+            # choice is coherent by construction.  But when the screen would
+            # *move* us onto an alignment another reading explains just as
+            # well - or when two @s tie with neither memory nor the keys able
+            # to tell them apart - this screen cannot place us at all: report
+            # it, touch nothing, and let one single-key move answer it.
+            if conflicts == 0:
+                winner_sticky = 0 if solved["offset"] == self.dungeon_offset else 1
+                rivals = [
+                    r
+                    for r in readings[1:]
+                    if r[0]["conflicts"] == 0
+                    and r[0]["matches"] >= matches
+                    and r[2] != hero_world
+                    # a rival only counts when it stands exactly where the
+                    # winner stands in the sticky order: an @ that could only
+                    # be the hero by *moving* the alignment is not really a
+                    # rival of the reading that keeps it
+                    and (0 if r[0]["offset"] == self.dungeon_offset else 1)
+                    == winner_sticky
+                    # ...nor one the keys can already tell from the winner:
+                    # a rival ties on continuity too, or the reading that
+                    # matches where the hero is expected has won on evidence.
+                    # (The common near-tie - bumping into another @ - is not
+                    # geometry's call at all: the game forbids walking onto
+                    # it, and the route layer decides that by its own rules.)
+                    and r[3] == continuity
+                ]
+                moving = solved["offset"] != self.dungeon_offset
+                if rivals or (moving and solved["alternatives"]):
+                    return {
+                        "offset": self.dungeon_offset,
+                        "player_world_pos": self.player_world_pos,
+                        "scrolled": False,
+                        "alignment": round(1.0 if coverage == 0 else matches / coverage, 3),
+                        "coverage": matches + conflicts,
+                        "conflicts": conflicts,
+                        "candidates": tried,
+                        "rejected_tiles": 0,
+                        "alignment_status": "ambiguous",
+                        "hero_candidates": [list(hero_world)] + [list(r[2]) for r in rivals],
+                        "alternatives": solved["alternatives"] if moving else [],
+                    }
+            alternatives = [] if conflicts else solved["alternatives"]
             scrolled = solved["offset"] != self.dungeon_offset
             self.dungeon_offset = solved["offset"]
 
@@ -836,6 +1056,7 @@ class DungeonMap:
         # what we knew and only learn genuinely new tiles
         overwrite = conflicts == 0
 
+        cells = self.screen_cells(screen_lines, map_rows)
         rejected = 0
         for srow, scol, char in cells:
             if not self.observe(
@@ -861,12 +1082,12 @@ class DungeonMap:
                 tile.trap = True
                 self._invalidate()
 
-        prow, pcol = player_screen
+        prow, pcol = hero
         self.set_player_position(
             (self.dungeon_offset[0] + prow, self.dungeon_offset[1] + pcol)
         )
         self.visit(*self.player_world_pos)
-        self._reveal_neighbours(screen_lines, player_screen, map_rows)
+        self._reveal_neighbours(screen_lines, hero, map_rows)
         # the screen just told us about walls, ground and fresh rockwall:
         # an open door seen for the first time has its whole setting at once
         self.infer_doorways()
@@ -882,6 +1103,9 @@ class DungeonMap:
             "conflicts": conflicts,
             "candidates": tried,
             "rejected_tiles": rejected,
+            "alignment_status": "locked",
+            "hero_candidates": [list(self.player_world_pos)],
+            "alternatives": alternatives,
         }
 
     def _reveal_neighbours(
@@ -1315,8 +1539,9 @@ class DungeonMap:
             "frontier_cells": sum(g["cells"] for g in groups),
             "frontier_areas": len(groups),
             "frontier_targets": groups[:6],
-            "downstairs": list(self.downstairs_pos) if self.downstairs_pos else None,
-            "upstairs": list(self.upstairs_pos) if self.upstairs_pos else None,
+            "downstairs": [list(p) for p in sorted(self.downstairs)],
+            "upstairs": [list(p) for p in sorted(self.upstairs)],
+            "unsearched_walls": len(self.unsearched_wall_targets()),
             "rooms": [
                 {
                     "id": room.id,
@@ -1337,8 +1562,9 @@ class DungeonMap:
             "level": self.level,
             "player_world_pos": list(self.player_world_pos) if self.player_world_pos else None,
             "dungeon_offset": list(self.dungeon_offset),
-            "downstairs_pos": list(self.downstairs_pos) if self.downstairs_pos else None,
-            "upstairs_pos": list(self.upstairs_pos) if self.upstairs_pos else None,
+            "downstairs": [list(p) for p in sorted(self.downstairs)],
+            "upstairs": [list(p) for p in sorted(self.upstairs)],
+            "searched": [list(p) for p in sorted(self.searched)],
             "tiles": {f"{r},{c}": t.to_dict() for (r, c), t in self.tiles.items()},
         }
 
@@ -1349,10 +1575,15 @@ class DungeonMap:
         map_obj.player_world_pos = tuple(pos) if pos else None
         offset = data.get("dungeon_offset")
         map_obj.dungeon_offset = tuple(offset) if offset else (0, 0)
-        down = data.get("downstairs_pos")
-        map_obj.downstairs_pos = tuple(down) if down else None
-        up = data.get("upstairs_pos")
-        map_obj.upstairs_pos = tuple(up) if up else None
+        # the old single-slot keys still in state files written before stairs
+        # became a ledger: read both, prefer the lists
+        for attr, key in (("downstairs", "downstairs"), ("upstairs", "upstairs")):
+            entries = data.get(key)
+            if entries is None:
+                legacy = data.get(f"{key}_pos")
+                entries = [legacy] if legacy else []
+            getattr(map_obj, attr).update(tuple(p) for p in entries)
+        map_obj.searched.update(tuple(p) for p in data.get("searched", []))
         for key, tile_data in data.get("tiles", {}).items():
             row, col = (int(v) for v in key.split(","))
             map_obj.tiles[(row, col)] = Tile.from_dict(tile_data)
