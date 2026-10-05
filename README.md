@@ -87,10 +87,12 @@ Four rules make it trustworthy to navigate by:
    as `.`.  A position once seen as `+` stays a doorway forever and renders
    `+` while shut, `'` while open - so the map says whether you can walk
    through it or have to `o`pen it first.  A door never yet seen shut is
-   recognised from its setting too: a wall glyph flanked by wall or confirmed
-   rockwall, with ground or merely unseen tiles beyond, can only be an open
-   door - corners and plain wall tiles cannot fit that pattern, and doorways
-   themselves count as evidence on neither axis, so nothing creeps.
+   recognised from its setting too: a wall glyph flanked by wall of the *same
+   kind* - two drawn walls or two confirmed rockwalls, never masonry beside
+   rock, which is a corner where the wall turns - with ground or merely
+   unseen tiles beyond, can only be an open door; plain wall tiles cannot fit
+   that pattern either, and doorways themselves count as evidence on neither
+   axis, so nothing creeps.
 4. **A `?` is only shown where you could actually go.** It must touch ground you
    can reach over remembered terrain, otherwise it is not an exploration target.
    Reachability also honours NetHack's rule that a diagonal step into or out of

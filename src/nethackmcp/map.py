@@ -20,10 +20,13 @@ The map is a record of *memory*, not of the real level.
   doorway forever, and its current glyph tells us whether the way through it
   is open right now.
 * A door never yet seen shut is still recognisable from its setting
-  (``infer_doorways``): a ``|`` with wall or confirmed rockwall on its left
-  and right, over ground or still-unseen tiles above and below, is an open
-  door - a plain wall tile always has the room's floor as one of its flanks,
-  and a corner always has wall, rock or a doorway where a passage would be.
+  (``infer_doorways``): a ``|`` whose left and right flanks are wall of the
+  *same kind* - two drawn wall glyphs, or two rockwalls confirmed by a bump -
+  over ground or still-unseen tiles above and below, is an open door.  The
+  kinds have to agree because walls turn at corners: one flank is masonry
+  and past the turn there is rock, never more masonry, and a door never sits
+  where the wall changes material.  A plain wall tile fails the other test:
+  along a room wall one flank is the room's own floor.
   Doorways themselves are evidence on neither axis, so an inference never
   creeps outwards from a known door.  The evidence has to be *seen*: an
   unexplored blank flanks nothing, because a blank is only rockwall once
@@ -89,6 +92,11 @@ OCCUPIABLE = frozenset({FLOOR, CAVE, DOOR, UP, DOWN, LIQUID})
 
 #: a wall glyph and a doorway are the same piece of geometry seen in two states
 DOORLIKE = frozenset({DOOR, WALL_V, WALL_H})
+
+#: the two materials a doorway can be set in; the flanks of one door must
+#: agree - masonry beside confirmed rock is a corner where the wall turns
+BUILDING = "building"
+ROCK = "rock"
 
 #: ground that may be either room floor or corridor without contradicting us
 GROUNDLIKE = frozenset({FLOOR, CAVE})
@@ -567,18 +575,25 @@ class DungeonMap:
     #  open doors, read from the wall around them
     # ------------------------------------------------------------------ #
 
-    def _wall_evidence(self, pos: tuple[int, int]) -> bool:
-        """One side of a door in a wall: remembered wall or confirmed rock.
+    def _wall_evidence(self, pos: tuple[int, int]) -> str | None:
+        """One side of a door in a wall: which kind of wall stands there.
 
-        ``|`` and ``-`` are the wall it continues, ``X`` is rockwall we
-        walked into - either says "the wall runs through here and not past
-        you".  An unexplored blank says nothing: it may be rockwall or it
-        may be ground nobody has looked at, so it is no evidence at all.
+        Either ``BUILDING`` - a remembered ``|``/``-``, the glyph mixing
+        freely along a run that turns - or ``ROCK``, a rockwall we walked
+        into.  Both say "the wall runs through here and not past you", but a
+        door sits in *one* wall, so its two flanks have to agree on the
+        material: masonry on one side and rock on the other is a corner, not
+        a doorway.  An unexplored blank says nothing: it may be rockwall or
+        it may be ground nobody has looked at, so it is no evidence at all.
         """
         tile = self.tiles.get(pos)
         if tile is None or tile.doorway:
-            return False
-        return bool(tile.solid) or tile.terrain in (WALL_V, WALL_H)
+            return None
+        if tile.solid:
+            return ROCK
+        if tile.terrain in (WALL_V, WALL_H):
+            return BUILDING
+        return None
 
     def _ground_or_unseen(self, pos: tuple[int, int]) -> bool:
         """What an open door leads to: ground you can stand on, water, or
@@ -605,31 +620,39 @@ class DungeonMap:
         """Flag the ``|`` and ``-`` tiles that can only be open doors.
 
         An open door is drawn with a wall glyph (``include/defsym.h``):
-        ``S_hodoor`` ``|`` is a door *in a horizontal wall* - you walk
-        through it north/south and the wall continues left/right - and
-        ``S_vodoor`` ``-`` is a door in a vertical wall.  So a wall glyph
-        is a doorway when both flanks are wall evidence and both ends of
-        the passage axis are ground or still unseen::
+        ``S_hodoor`` ``|`` is a door *in a horizontal wall* - the wall runs
+        east-west as ``-------`` and its open door is drawn ``---|---``, so
+        you walk through north/south and the wall continues left/right - and
+        ``S_vodoor`` ``-`` is a door in a vertical wall.  So a wall glyph is
+        a doorway when both flanks are wall evidence *of the same kind* and
+        both ends of the passage axis are ground or still unseen::
 
             ...               <- ground (or unseen) above
-           XX|X               <- '|' with rock or wall left and right
+           XX|X               <- '|' with rockwall left and right
             ##                <- ground below: the door into the top-right room
 
         No genuine wall tile can satisfy this: along a room wall one flank
-        is always the room's own floor, and a corner - drawn ``-`` however
-        the walls turn - has wall, rock or a doorway on its passage axis,
-        never plain ground.  Doorways count as evidence on neither axis:
-        that is what stops an inference creeping outwards from a known
-        door along the wall beside it.  Run after every merge and every
-        confirmed blank, so a door is recognised as soon as its
-        surroundings are known, "just like if it was a + first"; the state
-        is remembered, not re-guessed.
+        is always the room's own floor.  The kinds must agree because walls
+        turn at corners - the corner tile carries a wall glyph, the masonry
+        ends at it and outside the building stands rock - and a door is
+        never set where the wall changes material.  This is the difference
+        between ``---|---``, a way through, and ``X-|`` , the end of one.
+        Doorways count as evidence on neither axis: that is what stops an
+        inference creeping outwards from a known door along the wall beside
+        it.  Run after every merge and every confirmed blank, so a door is
+        recognised as soon as its surroundings are known, "just like if it
+        was a + first"; the state is remembered, not re-guessed - with one
+        exception: a flagged doorway whose flanks *contradict* each other
+        (masonry one side, confirmed rock the other) was a corner mistaken
+        for a door, and this pass retracts it.  Only inferred ones: what we
+        saw as ``+``, stood in, or found broken keeps its flag whatever the
+        flanks claim.
 
-        Returns how many tiles were newly flagged.
+        Returns how many tiles changed.
         """
         changed = 0
         for (row, col), tile in self.tiles.items():
-            if tile.doorway or tile.solid or not tile.memory:
+            if tile.solid or not tile.memory:
                 continue
             if tile.terrain == WALL_V:
                 flanks = ((row, col - 1), (row, col + 1))
@@ -639,7 +662,17 @@ class DungeonMap:
                 passage = ((row, col - 1), (row, col + 1))
             else:
                 continue
-            if all(self._wall_evidence(p) for p in flanks) and all(
+            left, right = (self._wall_evidence(p) for p in flanks)
+            if tile.doorway:
+                if (
+                    not tile.visited
+                    and left is not None
+                    and right is not None
+                    and left != right
+                ):
+                    tile.doorway = False
+                    changed += 1
+            elif left is not None and left == right and all(
                 self._ground_or_unseen(p) for p in passage
             ):
                 tile.doorway = True

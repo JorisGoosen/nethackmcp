@@ -792,6 +792,60 @@ def test_a_known_door_never_begets_another_one():
     assert not dungeon_map.is_passable(0, 0)
 
 
+def test_a_corner_is_never_a_doorway():
+    """The live bug: the room's '|' wall turned a corner and the rock outside
+    it was confirmed by a bump.  Masonry on one flank and rock on the other
+    is the end of a wall, not a door - but both flanks *were* evidence, and
+    with room floor on one side of the passage axis and never-seen blank on
+    the other, the old rule called it one and the player kicked it for turns."""
+    # '-' corner: '|' wall coming down to it, confirmed rock below it,
+    # room floor west, the never-seen outside east (level 2, (3,-21))
+    masonry_meets_rock = DungeonMap(level=1)
+    masonry_meets_rock.observe(-1, 0, WALL_V)
+    masonry_meets_rock.observe(0, 0, WALL_H)
+    masonry_meets_rock.observe(0, -1, FLOOR)
+    masonry_meets_rock.mark_solid(1, 0)
+    assert not masonry_meets_rock.get_tile(0, 0).doorway
+    assert not masonry_meets_rock.is_passable(0, 0)
+
+    # the mirrored corner (level 2, (8,-25)): rock above, '|' wall below
+    rock_above_wall = DungeonMap(level=1)
+    rock_above_wall.observe(0, 0, WALL_H)
+    rock_above_wall.observe(1, 0, WALL_V)
+    rock_above_wall.observe(0, 1, FLOOR)
+    rock_above_wall.mark_solid(-1, 0)
+    assert not rock_above_wall.get_tile(0, 0).doorway
+
+    # and the same turn drawn as '|': the horizontal wall running east from
+    # the corner, rock confirmed west of it, room floor north
+    turned_corner = DungeonMap(level=1)
+    turned_corner.observe(-1, 0, FLOOR)
+    turned_corner.observe(0, 0, WALL_V)
+    turned_corner.observe(0, 1, WALL_H)
+    turned_corner.mark_solid(0, -1)
+    assert not turned_corner.get_tile(0, 0).doorway
+
+
+def test_a_mistaken_corner_doorway_is_retracted():
+    """State saved before flanks had to agree still carries the corner
+    flagged as a door.  Inference re-reads it: contradictory flanks retract
+    the flag - but a door we stood in keeps it whatever the wall claims."""
+    dungeon_map = DungeonMap(level=1)
+    dungeon_map.observe(-1, 0, WALL_V)
+    dungeon_map.observe(0, 0, WALL_H)
+    dungeon_map.observe(0, -1, FLOOR)
+    dungeon_map.mark_solid(1, 0)  # completes the old rule's evidence
+    dungeon_map.get_tile(0, 0).doorway = True  # what the buggy inference stored
+    dungeon_map.infer_doorways()
+    assert not dungeon_map.get_tile(0, 0).doorway, "the corner is not a door"
+
+    # proven doors are beyond retraction: standing in it settles everything
+    dungeon_map.get_tile(0, 0).doorway = True
+    dungeon_map.get_tile(0, 0).visited = True
+    dungeon_map.infer_doorways()
+    assert dungeon_map.get_tile(0, 0).doorway, "we walked through that doorway"
+
+
 # --------------------------------------------------------------------------- #
 #  routes
 # --------------------------------------------------------------------------- #
